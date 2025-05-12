@@ -26,10 +26,14 @@
 - Add a parameter `as_spheres` to `UsdRenderer.render_points()` in order to choose whether to render
 - Add `wp.block_dim()` which allows to query the block dim in kernel code ([GH-695](https://github.com/NVIDIA/warp/issues/695))
   the points as USD spheres using a point instancer or as simple USD points.
+- Support passing tiles to user `wp.func` functions ([GH-682](https://github.com/NVIDIA/warp/issues/682)).
 - Add support for animating visibility of objects in the USD renderer
   ([GH-598](https://github.com/NVIDIA/warp/issues/598)).
 - Add `wp.sim.VBDIntegrator.rebuild_bvh()`, which rebuilds the BVH used for detecting self contacts.
 - Improved consistency of `warp.fem.lookup()` operator across geometries ([GH-618](https://github.com/NVIDIA/warp/pull/618)), added filtering parameters.
+- Add a [publications list](https://github.com/NVIDIA/warp/blob/main/PUBLICATIONS.md) of academic and research projects
+  leveraging Warp ([GH-686](https://github.com/NVIDIA/warp/issues/686)).
+- Add `wp.map()` function to map a function over arrays, add math operators for Warp arrays ([GH-694](https://github.com/NVIDIA/warp/issues/694)).
 
 ### Changed
 
@@ -61,6 +65,11 @@
 - Fixed inconsistency in orientation of 2D geometry side normals ([GH-629](https://github.com/NVIDIA/warp/issues/629)).
 - Fixed `wp.svd2()` with duplicate singular values and improved accuracy ([GH-679](https://github.com/NVIDIA/warp/issues/679)).
 - Fix text rendering in OpenGLRenderer ([GH-704](https://github.com/NVIDIA/warp/issues/629)).
+- Fixed tile type tool tips ([GH-714](https://github.com/NVIDIA/warp/issues/714))
+- Fix an issue with graph coloring on an empty graph ([GH-509](https://github.com/NVIDIA/warp/issues/509)).
+- Fix an integer overflow bug in the native graph coloring module ([GH-718](https://github.com/NVIDIA/warp/issues/718)).
+- Fix missing documentation for geometric structs
+  ([GH-674](https://github.com/NVIDIA/warp/issues/674)).
 
 ## [1.7.1] - 2025-04-30
 
