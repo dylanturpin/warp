@@ -288,6 +288,32 @@ class Example:
         self.renderer.render(self.state0)
         self.renderer.end_frame()
 
+    def get_state(self):
+        def to_numpy(arr):
+            return None if arr is None else arr.numpy()
+
+        return {
+            "particle_q": to_numpy(self.state0.particle_q),
+            "particle_qd": to_numpy(self.state0.particle_qd),
+        }
+
+
+def run_cloth_self_contact(
+    num_frames = 300,
+    device = None,
+    stage_path = None,
+    **_ignored,
+):
+    with wp.ScopedDevice(device):
+        example = Example(stage_path=stage_path, num_frames=num_frames)
+
+        example.run()
+
+        # Save USD if we rendered frames.
+        if example.renderer:
+            example.renderer.save()
+
+        return example.get_state()
 
 if __name__ == "__main__":
     import argparse
@@ -304,13 +330,8 @@ if __name__ == "__main__":
 
     args = parser.parse_known_args()[0]
 
-    with wp.ScopedDevice(args.device):
-        example = Example(stage_path=args.stage_path, num_frames=args.num_frames)
-
-        example.run()
-
-        frame_times = example.profiler["step"]
-        print(f"\nAverage frame sim time: {sum(frame_times) / len(frame_times):.2f} ms")
-
-        if example.renderer:
-            example.renderer.save()
+    state = run_cloth_self_contact(
+        num_frames=args.num_frames,
+        device=args.device,
+        stage_path=args.stage_path,
+    )

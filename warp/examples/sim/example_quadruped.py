@@ -33,50 +33,35 @@ import warp.sim
 import warp.sim.render
 
 
-# Taken from env/environment.py
-def compute_env_offsets(num_envs, env_offset=(5.0, 0.0, 5.0), up_axis="Y"):
-    # compute positional offsets per environment
-    env_offset = np.array(env_offset)
-    nonzeros = np.nonzero(env_offset)[0]
-    num_dim = nonzeros.shape[0]
-    if num_dim > 0:
-        side_length = int(np.ceil(num_envs ** (1.0 / num_dim)))
-        env_offsets = []
-    else:
-        env_offsets = np.zeros((num_envs, 3))
-    if num_dim == 1:
-        for i in range(num_envs):
-            env_offsets.append(i * env_offset)
-    elif num_dim == 2:
-        for i in range(num_envs):
-            d0 = i // side_length
-            d1 = i % side_length
-            offset = np.zeros(3)
-            offset[nonzeros[0]] = d0 * env_offset[nonzeros[0]]
-            offset[nonzeros[1]] = d1 * env_offset[nonzeros[1]]
-            env_offsets.append(offset)
-    elif num_dim == 3:
-        for i in range(num_envs):
-            d0 = i // (side_length * side_length)
-            d1 = (i // side_length) % side_length
-            d2 = i % side_length
-            offset = np.zeros(3)
-            offset[0] = d0 * env_offset[0]
-            offset[1] = d1 * env_offset[1]
-            offset[2] = d2 * env_offset[2]
-            env_offsets.append(offset)
-    env_offsets = np.array(env_offsets)
-    min_offsets = np.min(env_offsets, axis=0)
-    correction = min_offsets + (np.max(env_offsets, axis=0) - min_offsets) / 2.0
-    if isinstance(up_axis, str):
-        up_axis = "XYZ".index(up_axis.upper())
-    correction[up_axis] = 0.0  # ensure the envs are not shifted below the ground plane
-    env_offsets -= correction
-    return env_offsets
+def _featherstone_factory(model, **kwargs):
+    return wp.sim.FeatherstoneIntegrator(model, use_tile_gemm=False, fuse_cholesky=False, **kwargs)
+
+
+def _xpbd_factory(model, **kwargs):
+    return wp.sim.XPBDIntegrator(**kwargs)
+
+
+def _semiimplicit_factory(model, **kwargs):
+    return wp.sim.SemiImplicitIntegrator(**kwargs)
+
+
+SOLVER_MAP = {
+    "featherstone": _featherstone_factory,
+    "xpbd": _xpbd_factory,
+    "euler": _semiimplicit_factory,
+}
 
 
 class Example:
-    def __init__(self, stage_path="example_quadruped.usd", num_envs=8):
+    def __init__(
+        self,
+        stage_path = "example_quadruped.usd",
+        num_envs = 8,
+        solver_cls = None,
+        enable_timers = True,
+        policy = "none",
+        solver_kwargs = None,
+    ):
         articulation_builder = wp.sim.ModelBuilder()
         wp.sim.parse_urdf(
             os.path.join(warp.examples.get_asset_directory(), "quadruped.urdf"),
@@ -106,7 +91,7 @@ class Example:
 
         self.num_envs = num_envs
 
-        offsets = compute_env_offsets(self.num_envs)
+        offsets = warp.examples.compute_env_offsets(self.num_envs)
         for i in range(self.num_envs):
             builder.add_builder(articulation_builder, xform=wp.transform(offsets[i], wp.quat_identity()))
 
@@ -126,11 +111,19 @@ class Example:
         self.use_tile_gemm = False
         self.fuse_cholesky = False
 
-        # self.integrator = wp.sim.XPBDIntegrator()
-        # self.integrator = wp.sim.SemiImplicitIntegrator()
-        self.integrator = wp.sim.FeatherstoneIntegrator(
-            self.model, use_tile_gemm=self.use_tile_gemm, fuse_cholesky=self.fuse_cholesky
-        )
+        self.enable_timers = enable_timers
+
+        self.policy = policy.lower()
+        if self.policy not in ("none", "sin"):
+            raise ValueError(f"Unsupported policy '{policy}'. Valid options are 'none' or 'sin'.")
+
+        if solver_kwargs is None:
+            solver_kwargs = {}
+
+        if solver_cls is None:
+            solver_cls = SOLVER_MAP["xpbd"]
+
+        self.integrator = solver_cls(self.model, **solver_kwargs)
 
         if stage_path:
             self.renderer = wp.sim.render.SimRenderer(self.model, stage_path)
@@ -139,6 +132,10 @@ class Example:
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
+
+        self.control = self.model.control()
+        if self.policy == "sin":
+            self._init_sin_policy()
 
         wp.sim.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, None, self.state_0)
 
@@ -152,14 +149,32 @@ class Example:
             self.graph = None
 
     def simulate(self):
+        if self.policy == "sin":
+            wp.launch(
+                _generate_sin_targets,
+                dim=self.control.joint_act.shape[0],
+                inputs=[
+                    self._base_targets_w,
+                    self._amp_w,
+                    self._phase_w,
+                    self._time_device,
+                    self._freq,
+                ],
+                outputs=[self.control.joint_act],
+                device=self.model.device,
+            )
+
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             wp.sim.collide(self.model, self.state_0)
-            self.integrator.simulate(self.model, self.state_0, self.state_1, self.sim_dt)
+            self.integrator.simulate(self.model, self.state_0, self.state_1, self.sim_dt, self.control)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        with wp.ScopedTimer("step"):
+        if self.policy == "sin":
+            wp.copy(self._time_device, wp.array([self.sim_time], dtype=wp.float32, device=self.model.device))
+
+        with wp.ScopedTimer("step", active=self.enable_timers):
             if self.use_cuda_graph:
                 wp.capture_launch(self.graph)
             else:
@@ -170,10 +185,115 @@ class Example:
         if self.renderer is None:
             return
 
-        with wp.ScopedTimer("render"):
+        with wp.ScopedTimer("render", active=self.enable_timers):
             self.renderer.begin_frame(self.sim_time)
             self.renderer.render(self.state_0)
             self.renderer.end_frame()
+
+    def get_state(self) -> dict:
+        """Return key tensors as NumPy arrays."""
+
+        def to_numpy(arr):
+            return None if arr is None else arr.numpy()
+
+        return {
+            "joint_q": to_numpy(self.state_0.joint_q),
+            "joint_qd": to_numpy(self.state_0.joint_qd),
+            "body_q": to_numpy(self.state_0.body_q),
+            "body_qd": to_numpy(self.state_0.body_qd),
+        }
+
+    def _init_sin_policy(self) -> None:
+        # initial target matching initial joint_q
+        base_single_env = np.array(
+            [
+                0.2,
+                0.4,
+                -0.6,
+                -0.2,
+                -0.4,
+                0.6,
+                -0.2,
+                0.4,
+                -0.6,
+                0.2,
+                -0.4,
+                0.6,
+            ],
+            dtype=np.float32,
+        )
+
+        # amplitudes: ±20-40 % of the nominal range.
+        # for each leg we use hip 0.2 rad, knee 0.4 rad, ankle 0.2 rad.
+        amp_leg = np.array([0.2, 0.4, 0.2], dtype=np.float32)
+        amp_single_env = np.tile(amp_leg, 4)
+
+        # phase offsets between legs
+        leg_phase_offsets = [0.0, math.pi, math.pi / 2.0, 3.0 * math.pi / 2.0]
+        phase_single_env = np.concatenate([np.full(3, p, dtype=np.float32) for p in leg_phase_offsets])
+
+        # tile across environments
+        base_np = np.tile(base_single_env, self.num_envs).astype(np.float32)
+        amp_np = np.tile(amp_single_env, self.num_envs).astype(np.float32)
+        phase_np = np.tile(phase_single_env, self.num_envs).astype(np.float32)
+
+        self._base_targets_w = wp.array(base_np, dtype=wp.float32, device=self.model.device)
+        self._amp_w = wp.array(amp_np, dtype=wp.float32, device=self.model.device)
+        self._phase_w = wp.array(phase_np, dtype=wp.float32, device=self.model.device)
+
+        self._time_device = wp.array([0.0], dtype=wp.float32, device=self.model.device)
+
+        self._freq = 1.0
+
+        self.control.joint_act = wp.array(base_np, dtype=wp.float32, device=self.model.device)
+
+@wp.kernel
+def _generate_sin_targets(
+    base: wp.array(dtype=float),
+    amp: wp.array(dtype=float),
+    phase: wp.array(dtype=float),
+    time_val: wp.array(dtype=float),
+    freq: float,
+    out: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    t = time_val[0]
+    out[tid] = base[tid] + amp[tid] * wp.sin(2.0 * wp.pi * freq * t + phase[tid])
+
+def run_quadruped(
+    solver_name = "xpbd",
+    num_frames = 300,
+    num_envs = 8,
+    device = None,
+    stage_path = None,
+    enable_timers = True,
+    policy = "none",
+    solver_kwargs = None,
+):
+    solver_factory = SOLVER_MAP.get(solver_name.lower())
+    if solver_factory is None:
+        raise ValueError(f"Unknown solver '{solver_name}'. Valid keys: {list(SOLVER_MAP)}")
+
+    with wp.ScopedDevice(device):
+        example = Example(
+            stage_path=stage_path,
+            num_envs=num_envs,
+            solver_cls=solver_factory,
+            enable_timers=enable_timers,
+            policy=policy,
+            solver_kwargs=solver_kwargs,
+        )
+
+        for _ in range(num_frames):
+            example.step()
+            if example.renderer:
+                example.render()
+
+        if example.renderer:
+            example.renderer.save()
+
+        return example.get_state()
+
 
 
 if __name__ == "__main__":
@@ -189,15 +309,29 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_frames", type=int, default=300, help="Total number of frames.")
     parser.add_argument("--num_envs", type=int, default=8, help="Total number of simulated environments.")
+    parser.add_argument(
+        "--solver",
+        type=str,
+        default="xpbd",
+        choices=list(SOLVER_MAP.keys()),
+        help="Which integrator to use for the simulation.",
+    )
+    parser.add_argument(
+        "--policy",
+        type=str,
+        default="sin",
+        choices=("none", "sin"),
+        help="Which control policy to apply during the simulation.",
+    )
 
     args = parser.parse_known_args()[0]
 
-    with wp.ScopedDevice(args.device):
-        example = Example(stage_path=args.stage_path, num_envs=args.num_envs)
-
-        for _ in range(args.num_frames):
-            example.step()
-            example.render()
-
-        if example.renderer:
-            example.renderer.save()
+    state = run_quadruped(
+        solver_name=args.solver,
+        num_frames=args.num_frames,
+        num_envs=args.num_envs,
+        device=args.device,
+        stage_path=args.stage_path,
+        enable_timers=True,
+        policy=args.policy,
+    )
