@@ -121,7 +121,10 @@ def aslinearoperator(A: _Matrix, batch_offsets: wp.array | None = None) -> Linea
 
         - :class:`warp.sparse.BsrMatrix`
         - two-dimensional ``warp.array``; then ``A`` is assumed to be a dense matrix
-        - one-dimensional ``warp.array``; then ``A`` is assumed to be a diagonal matrix
+        - one-dimensional ``warp.array`` of scalar or vector dtype; then ``A`` is assumed to be a
+          diagonal matrix
+        - one-dimensional ``warp.array`` of square-matrix dtype; then ``A`` is assumed to be a
+          block-diagonal matrix
         - :class:`warp.optim.linear.LinearOperator`; no casting necessary, ``batch_offsets`` is ignored
 
     Args:
@@ -167,10 +170,30 @@ def aslinearoperator(A: _Matrix, batch_offsets: wp.array | None = None) -> Linea
             _as_scalar_array(A), _as_scalar_array(x), _as_scalar_array(y), _as_scalar_array(z), alpha, beta
         )
 
+    def diag_mv_mat(x, y, z, alpha, beta):
+        block_rows = A.dtype._shape_[0]
+        vec_dtype = wp.types.vector(length=block_rows, dtype=type_scalar_type(A.dtype))
+        scalar_count = A.shape[0] * block_rows
+        x_view = sparse._vec_array_view(x, vec_dtype, expected_scalar_count=scalar_count)
+        y_view = sparse._vec_array_view(y, vec_dtype, expected_scalar_count=scalar_count)
+        z_view = sparse._vec_array_view(z, vec_dtype, expected_scalar_count=scalar_count)
+        return diag_mv_impl(A, x_view, y_view, z_view, alpha, beta)
+
     if isinstance(A, wp.array):
         if A.ndim == 2:
             return LinearOperator(A.shape, A.dtype, A.device, matvec=dense_mv, batch_offsets=batch_offsets)
         if A.ndim == 1:
+            if type_is_matrix(A.dtype):
+                if A.dtype._shape_[0] != A.dtype._shape_[1]:
+                    raise ValueError("Block-diagonal operators require square matrix blocks")
+                scalar_dim = A.shape[0] * A.dtype._shape_[0]
+                return LinearOperator(
+                    (scalar_dim, scalar_dim),
+                    type_scalar_type(A.dtype),
+                    A.device,
+                    matvec=diag_mv_mat,
+                    batch_offsets=batch_offsets,
+                )
             if type_is_vector(A.dtype):
                 return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv_vec, batch_offsets=batch_offsets)
             return LinearOperator(A.shape, A.dtype, A.device, matvec=diag_mv, batch_offsets=batch_offsets)
@@ -189,6 +212,11 @@ def preconditioner(A: _Matrix, ptype: str = "diag") -> LinearOperator:
 
          - ``"diag"``: Diagonal (a.k.a. Jacobi) preconditioner
          - ``"diag_abs"``: Similar to Jacobi, but using the absolute value of diagonal coefficients
+         - ``"block_diag"``: Block-Jacobi preconditioner for a :class:`warp.sparse.BsrMatrix` with square
+           matrix blocks of ``float32`` or ``float64`` scalar type. Each diagonal block is inverted exactly
+           with a Cholesky factorization, so diagonal blocks must be symmetric positive-definite (as is the
+           case for Gauss-Newton normal equations or FEM stiffness matrices). Much stronger than ``"diag"``
+           when degrees of freedom within a block are strongly coupled.
          - ``"id"``: Identity (null) preconditioner
     """
 
@@ -196,6 +224,8 @@ def preconditioner(A: _Matrix, ptype: str = "diag") -> LinearOperator:
         return None
     if ptype in ("diag", "diag_abs"):
         return _make_jacobi_preconditioner(A, use_abs=ptype == "diag_abs")
+    if ptype == "block_diag":
+        return _make_block_jacobi_preconditioner(A)
 
     raise ValueError(f"Unsupported preconditioner type '{ptype}'")
 
@@ -223,6 +253,61 @@ def _make_jacobi_preconditioner(A: _Matrix, use_abs: bool) -> LinearOperator:
         )
     else:
         raise ValueError("Unsupported source matrix type for building diagonal preconditioner")
+
+    return aslinearoperator(inv_diag)
+
+
+@functools.cache
+def _create_block_cholesky_inverse_kernel(block_rows: int):
+    @wp.kernel(module="unique")
+    def block_cholesky_inverse_kernel(
+        diag_blocks: wp.array3d(dtype=Any),
+        identity: wp.array2d(dtype=Any),
+        inv_blocks: wp.array3d(dtype=Any),
+    ):
+        i = wp.tid()
+        A_blk = wp.tile_load(diag_blocks[i], shape=(block_rows, block_rows))
+        L = wp.tile_cholesky(A_blk)
+        rhs = wp.tile_load(identity, shape=(block_rows, block_rows))
+        X = wp.tile_cholesky_solve(L, rhs)
+        wp.tile_store(inv_blocks[i], X)
+
+    return block_cholesky_inverse_kernel
+
+
+@wp.kernel(module="unique")
+def _fill_identity_kernel(mat: wp.array2d(dtype=Any)):
+    i = wp.tid()
+    mat[i, i] = mat.dtype(1.0)
+
+
+def _make_block_jacobi_preconditioner(A: _Matrix) -> LinearOperator:
+    if not isinstance(A, sparse.BsrMatrix) or not type_is_matrix(A.dtype):
+        raise ValueError("Block-Jacobi preconditioner requires a BsrMatrix with matrix-valued blocks")
+    if A.block_shape[0] != A.block_shape[1]:
+        raise ValueError("Block-Jacobi preconditioner requires square blocks")
+    if A.scalar_type not in (wp.float32, wp.float64):
+        raise ValueError("Block-Jacobi preconditioner requires float32 or float64 blocks")
+
+    block_rows = A.block_shape[0]
+    A_diag = sparse.bsr_get_diag(A)
+    inv_diag = wp.empty_like(A_diag)
+
+    identity = wp.zeros((block_rows, block_rows), dtype=A.scalar_type, device=A.device)
+    wp.launch(_fill_identity_kernel, dim=block_rows, device=A.device, inputs=[identity])
+
+    kernel = _create_block_cholesky_inverse_kernel(block_rows)
+    wp.launch_tiled(
+        kernel,
+        dim=A.nrow,
+        inputs=[
+            sparse._as_3d_array(A_diag, A.block_shape),
+            identity,
+            sparse._as_3d_array(inv_diag, A.block_shape),
+        ],
+        block_dim=32,
+        device=A.device,
+    )
 
     return aslinearoperator(inv_diag)
 

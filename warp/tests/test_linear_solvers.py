@@ -529,6 +529,74 @@ def test_functor_compat_errors(test, device):
             bic_state(M=M2)
 
 
+def _make_block_spd_system(n: int, block_rows: int, seed: int, dtype, device, coupling: float = 0.1):
+    """Block-tridiagonal SPD system with strongly coupled, ill-conditioned diagonal blocks."""
+    rng = np.random.default_rng(seed)
+    np_dtype = wp.dtype_to_numpy(dtype)
+
+    scale = np.diag(np.logspace(0.0, 2.0, block_rows))
+    rows, cols, vals = [], [], []
+    for i in range(n):
+        B = rng.standard_normal((block_rows, block_rows))
+        D = scale @ (B @ B.T + block_rows * np.eye(block_rows)) @ scale
+        rows.append(i)
+        cols.append(i)
+        vals.append(D)
+        if i > 0:
+            O = coupling * scale @ rng.standard_normal((block_rows, block_rows)) @ scale
+            rows.append(i)
+            cols.append(i - 1)
+            vals.append(O)
+            rows.append(i - 1)
+            cols.append(i)
+            vals.append(O.T)
+
+    A = wp.sparse.bsr_from_triplets(
+        n,
+        n,
+        wp.array(np.array(rows, dtype=np.int32), device=device),
+        wp.array(np.array(cols, dtype=np.int32), device=device),
+        wp.array(np.array(vals, dtype=np_dtype), dtype=dtype, device=device),
+        prune_numerical_zeros=False,
+    )
+    b = wp.array(rng.uniform(low=-1.0, high=1.0, size=n * block_rows).astype(np_dtype), device=device)
+    return A, b
+
+
+def test_block_diag_preconditioner(test, device):
+    with wp.ScopedDevice(device):
+        block_rows = 4
+
+        # exactness: on a pure block-diagonal matrix, M (A b) == b
+        A_diag, b = _make_block_spd_system(n=16, block_rows=block_rows, seed=7, dtype=wp.float32, device=device, coupling=0.0)
+        M = preconditioner(A_diag, "block_diag")
+        y = wp.zeros_like(b)
+        z = wp.zeros_like(b)
+        wp.sparse.bsr_mv(A_diag, b, y)
+        M.matvec(y, z, z, alpha=1.0, beta=0.0)
+        assert_np_equal(z.numpy(), b.numpy(), tol=1e-4)
+
+        # strength: block-Jacobi converges in fewer CG iterations than point-Jacobi
+        # on a system with strong intra-block coupling
+        A, b = _make_block_spd_system(n=32, block_rows=block_rows, seed=11, dtype=wp.float32, device=device)
+        x = wp.zeros_like(b)
+        niter_diag, err, atol = cg(A, b, x, maxiter=500, tol=1e-6, M=preconditioner(A, "diag"), check_every=1)
+        test.assertLessEqual(err, atol)
+
+        x.zero_()
+        niter_block, err, atol = cg(A, b, x, maxiter=500, tol=1e-6, M=preconditioner(A, "block_diag"), check_every=1)
+        test.assertLessEqual(err, atol)
+        test.assertLess(niter_block, niter_diag)
+
+
+def test_block_diag_preconditioner_errors(test, device):
+    with wp.ScopedDevice(device):
+        # scalar (CSR) matrices have no blocks to invert
+        A, _b = _make_spd_system(n=16, seed=3, dtype=wp.float32, device=device)
+        with test.assertRaises(ValueError):
+            preconditioner(aslinearoperator(A), "block_diag")
+
+
 class TestLinearSolvers(unittest.TestCase):
     pass
 
@@ -573,6 +641,12 @@ add_function_test(
     "test_tiled_dot_large_single_batch",
     test_tiled_dot_large_single_batch,
     devices=get_cuda_test_devices(),
+)
+add_function_test(
+    TestLinearSolvers, "test_block_diag_preconditioner", test_block_diag_preconditioner, devices=devices
+)
+add_function_test(
+    TestLinearSolvers, "test_block_diag_preconditioner_errors", test_block_diag_preconditioner_errors, devices=devices
 )
 add_function_test(TestLinearSolvers, "test_functor_reuse", test_functor_reuse, devices=devices)
 add_function_test(TestLinearSolvers, "test_functor_preconditioner", test_functor_preconditioner, devices=devices)

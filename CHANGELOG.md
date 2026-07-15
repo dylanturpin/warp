@@ -4,6 +4,12 @@
 
 ### Added
 
+- Add `wp.optim.linear.preconditioner(A, "block_diag")`, a block-Jacobi preconditioner for BSR matrices with square
+  symmetric-positive-definite diagonal blocks (Gauss-Newton normal equations, FEM stiffness matrices, trajectory
+  optimization). Each diagonal block is inverted exactly with a tile Cholesky factorization; converges in
+  substantially fewer iterations than the point-Jacobi `"diag"` preconditioner when degrees of freedom within a
+  block are strongly coupled. `wp.optim.linear.aslinearoperator()` now also accepts a one-dimensional array of
+  square-matrix dtype, interpreted as a block-diagonal operator.
 - Add rebuildable NanoVDB volumes through `wp.Volume.allocate_by_tiles(..., rebuildable=True)`,
   `wp.Volume.allocate_by_voxels(..., rebuildable=True)`, and `wp.Volume.rebuild()`. Support fixed capacities, optional
   point masks, CPU execution, CUDA graph-capturable allocation and rebuilding, and in-place refreshes of rebuildable
