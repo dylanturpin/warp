@@ -4358,6 +4358,9 @@ class array(Array[DType, NDim]):
 
     def zero_(self):
         """Zero out the array entries."""
+        if warp._src.context._capture_memory_graph(self.device) is not None:
+            self.fill_(0)
+            return
         self._apic_ensure_tracked()
         if self.is_contiguous:
             # simple memset is usually faster than generic fill
@@ -4433,10 +4436,21 @@ class array(Array[DType, NDim]):
                 else:
                     cvalue = self.dtype._type_(value)
         except Exception as e:
+            memory_graph = warp._src.context._capture_memory_graph(self.device)
+            if memory_graph is not None:
+                warp._src.context.capture_invalidate(memory_graph, f"Failed captured fill value conversion: {e}")
             raise ValueError(f"Failed to convert the value to the array data type: {e}") from e
 
         cvalue_ptr = ctypes.pointer(cvalue)
         cvalue_size = ctypes.sizeof(cvalue)
+
+        memory_graph = warp._src.context._capture_memory_graph(self.device)
+        if memory_graph is not None:
+            from warp._src import capture_memory  # noqa: PLC0415
+
+            capture_memory.fill(memory_graph, self, ctypes.string_at(cvalue_ptr, cvalue_size))
+            self.mark_init()
+            return
 
         # prefer using memtile for contiguous arrays, because it should be faster than generic fill
         if self.is_contiguous:
@@ -5177,6 +5191,11 @@ class noncontiguous_array_base(Array[DType, NDim]):
     def fill_(self, value):
         if self.size == 0:
             return
+
+        memory_graph = warp._src.context._capture_memory_graph(self.device)
+        if memory_graph is not None:
+            warp._src.context.capture_invalidate(memory_graph, "Memory operation capture requires regular Warp arrays")
+            raise NotImplementedError("Memory operation capture requires regular Warp arrays")
 
         # try to convert the given value to the array dtype
         try:

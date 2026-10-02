@@ -1961,6 +1961,8 @@ class ScopedCapture:
             :func:`capture_save`. On CPU, recording always occurs regardless
             of this flag (needed for CPU graph replay). Default is ``False``.
         record_launches: Retain immutable CUDA kernel launch records; see :func:`capture_get_launches`.
+        record_memory_operations: Lower supported array fills/copies to recorded kernels;
+            requires ``record_launches=True``. See :func:`capture_begin`.
         capture_mode: The :class:`~warp.CaptureMode` to use when opening
             the capture. Defaults to :attr:`CaptureMode.THREAD_LOCAL`.
             See :func:`capture_begin` for details.
@@ -1991,6 +1993,7 @@ class ScopedCapture:
         apic: bool = False,
         capture_mode: CaptureMode = CaptureMode.THREAD_LOCAL,
         record_launches: bool = False,
+        record_memory_operations: bool = False,
     ):
         self.device = device
         self.stream = stream
@@ -1999,6 +2002,7 @@ class ScopedCapture:
         self.apic = apic
         self.capture_mode = capture_mode
         self.record_launches = record_launches
+        self.record_memory_operations = record_memory_operations
         self.active = False
         self.graph = None
 
@@ -2012,6 +2016,7 @@ class ScopedCapture:
                 apic=self.apic,
                 capture_mode=self.capture_mode,
                 record_launches=self.record_launches,
+                record_memory_operations=self.record_memory_operations,
             )
             self.active = True
             return self

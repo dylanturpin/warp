@@ -442,6 +442,175 @@ def test_default_capture_unchanged(test, device):
             wp.capture_begin(apic=True, record_launches=True)
 
 
+def test_captured_memory_values(test, device):
+    with wp.ScopedDevice(device):
+        byte_vector = wp.types.vector(length=3, dtype=wp.uint8)
+        examples = (
+            (wp.float32, -0.0),
+            (wp.float64, -0.0),
+            (wp.int16, -123),
+            (wp.bool, True),
+            (wp.vec3, (1.0, -0.0, 3.0)),
+            (byte_vector, (1, 2, 3)),
+        )
+        for dtype, value in examples:
+            with test.subTest(dtype=dtype):
+                source = wp.empty((3, 4), dtype=dtype)
+                destination = wp.empty_like(source)
+                reference = wp.full((3, 4), value, dtype=dtype, device="cpu").numpy().tobytes()
+                with wp.ScopedCapture(record_launches=True, record_memory_operations=True) as capture:
+                    source.fill_(value)
+                    wp.copy(destination, source)
+                fill, copy = wp.capture_get_memory_operations(capture.graph)
+                launches = wp.capture_get_launches(capture.graph)
+                test.assertIsInstance(fill, wp.CapturedFill)
+                test.assertIsInstance(copy, wp.CapturedCopy)
+                test.assertIs(fill.launch, launches[0])
+                test.assertIs(copy.launch, launches[1])
+                test.assertEqual(fill.array_dtype, dtype)
+                test.assertEqual(fill.array_descriptor, bytes(source.__ctype__()))
+                test.assertEqual(copy.destination_descriptor, bytes(destination.__ctype__()))
+                test.assertEqual(fill.value_bytes, reference[: wp.types.type_size_in_bytes(dtype)])
+                test.assertEqual(fill.launch.dim[0], 3)
+                with test.assertRaises(dataclasses.FrozenInstanceError):
+                    fill.value_bytes = b""
+                wp.capture_launch(capture.graph)
+                test.assertEqual(destination.numpy().tobytes(), reference)
+
+
+def test_captured_memory_strided_rows(test, device):
+    with wp.ScopedDevice(device):
+        # Packed fields have overlapping address spans but disjoint row payloads.
+        storage = wp.full((4, 12), wp.uint8(211), dtype=wp.uint8)
+        left = wp.array(ptr=storage.ptr, shape=(4, 3), strides=(12, 1), dtype=wp.uint8, device=device)
+        right = wp.array(ptr=storage.ptr + 4, shape=(4, 3), strides=(12, 1), dtype=wp.uint8, device=device)
+        with wp.ScopedCapture(record_launches=True, record_memory_operations=True) as capture:
+            left.fill_(wp.uint8(37))
+            wp.copy(right, left)
+        fill, copy = wp.capture_get_memory_operations(capture.graph)
+        test.assertEqual(fill.launch.dim, (4, 3))  # Byte path, including odd row widths.
+        test.assertEqual(copy.launch.dim, (4, 3))
+        wp.capture_launch(capture.graph)
+        expected = np.full((4, 12), 211, np.uint8)
+        expected[:, :3], expected[:, 4:7] = 37, 37
+        np.testing.assert_array_equal(storage.numpy(), expected)
+
+
+def test_captured_memory_zero_and_noops(test, device):
+    with wp.ScopedDevice(device):
+        values = wp.full((2, 5), 9.0, dtype=float)
+        empty = wp.empty((0, 5), dtype=float)
+        with wp.ScopedCapture(record_launches=True, record_memory_operations=True) as capture:
+            values.zero_()
+            wp.copy(values, values)
+            empty.zero_()
+            wp.copy(empty, empty)
+            active = device.captures[wp.get_stream(device)]
+            with test.assertRaisesRegex(RuntimeError, "Pause or finish"):
+                wp.capture_get_memory_operations(active)
+        (fill,) = wp.capture_get_memory_operations(capture.graph)
+        test.assertEqual(fill.value_bytes, bytes(4))
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(values.numpy(), np.zeros((2, 5), np.float32))
+        with wp.ScopedCapture(record_launches=True) as ordinary:
+            values.fill_(3.0)
+            wp.copy(values, values)
+        test.assertEqual(wp.capture_get_memory_operations(ordinary.graph), ())
+        wp.capture_launch(ordinary.graph)
+        np.testing.assert_array_equal(values.numpy(), np.full((2, 5), 3.0, np.float32))
+
+
+def test_captured_memory_owners_and_snapshots(test, device):
+    with wp.ScopedDevice(device):
+        source = wp.full((3, 2), 4, dtype=int)
+        destination = wp.empty_like(source)
+        source_ref, destination_ref = weakref.ref(source), weakref.ref(destination)
+        with wp.ScopedCapture(record_launches=True, record_memory_operations=True) as capture:
+            wp.copy(destination, source)
+        (record,) = wp.capture_get_memory_operations(capture.graph)
+        saved = record.destination_descriptor
+        destination.shape = (6,)
+        test.assertEqual(record.destination_descriptor, saved)
+        destination.shape = (3, 2)
+        del source, destination
+        gc.collect()
+        test.assertIsNotNone(source_ref())
+        test.assertIsNotNone(destination_ref())
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(destination_ref().numpy(), np.full((3, 2), 4, np.int32))
+
+
+def test_captured_memory_rejects_unsupported(test, device):
+    with wp.ScopedDevice(device):
+        source = wp.zeros((4, 4), dtype=float)
+        destination = wp.empty_like(source)
+        host = wp.empty(source.shape, dtype=float, device="cpu")
+        inner_strided = source[:, ::2]
+        overlap = wp.array(ptr=source.ptr + 4, shape=(4, 3), strides=(16, 4), dtype=float, device=device)
+        left = wp.array(ptr=source.ptr, shape=(4, 3), strides=(16, 4), dtype=float, device=device)
+        differentiated = wp.empty(source.shape, dtype=float, requires_grad=True)
+        operations = (
+            (lambda: wp.copy(destination, source, count=2), "full-array"),
+            (lambda: wp.copy(destination, source, dest_offset=1), "full-array"),
+            (lambda: wp.copy(host, source), "captured CUDA device"),
+            (inner_strided.zero_, "contiguous inner"),
+            (lambda: wp.copy(overlap, left), "overlapping copy"),
+            (differentiated.zero_, "autodiff"),
+            (lambda: destination.fill_(object()), "Failed to convert"),
+        )
+        for operation, message in operations:
+            with test.subTest(message=message):
+                with wp.ScopedCapture(record_launches=True, record_memory_operations=True) as capture:
+                    with test.assertRaisesRegex((ValueError, NotImplementedError), message):
+                        operation()
+                with test.assertRaisesRegex(RuntimeError, "invalid"):
+                    wp.capture_launch(capture.graph)
+
+
+def test_captured_memory_streams_and_conditions(test, device):
+    if not wp.is_conditional_graph_supported():
+        test.skipTest("Conditional graphs require CUDA 12.4+")
+    with wp.ScopedDevice(device):
+        source = wp.zeros((3, 2), dtype=int)
+        destination = wp.empty_like(source)
+        condition = wp.ones(1, dtype=int)
+        main, side = wp.Stream(device), wp.Stream(device)
+        fork, join = wp.Event(device), wp.Event(device)
+        with wp.ScopedStream(main, sync_enter=False, sync_exit=False):
+            with wp.ScopedCapture(stream=main, record_launches=True, record_memory_operations=True) as capture:
+                wp.capture_if(condition, lambda: source.fill_(27))
+                main.record_event(fork)
+                side.wait_event(fork)
+                wp.copy(destination, source, stream=side)
+                side.record_event(join)
+                main.wait_event(join)
+        fill, copy = wp.capture_get_memory_operations(capture.graph)
+        test.assertNotEqual(fill.launch.graph_handle, capture.graph.graph.value)
+        test.assertEqual(copy.launch.graph_handle, capture.graph.graph.value)
+        test.assertEqual(len(wp.capture_get_launches(capture.graph)), 2)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(destination.numpy(), np.full((3, 2), 27, np.int32))
+
+
+def test_captured_memory_rejects_stale_array_abi(test, device):
+    with wp.ScopedDevice(device):
+        array = wp.zeros((4, 4), dtype=float)
+        other = wp.empty_like(array)
+        array.__ctype__()
+        for name, value in (("ptr", other.ptr), ("shape", (2, 8)), ("strides", (32, 4)), ("size", 8)):
+            with test.subTest(attribute=name):
+                previous = getattr(array, name)
+                try:
+                    setattr(array, name, value)
+                    with wp.ScopedCapture(record_launches=True, record_memory_operations=True) as capture:
+                        with test.assertRaisesRegex(ValueError, "descriptor changed"):
+                            array.fill_(3.0)
+                    with test.assertRaisesRegex(RuntimeError, "invalid"):
+                        wp.capture_launch(capture.graph)
+                finally:
+                    setattr(array, name, previous)
+
+
 class TestCaptureLaunches(unittest.TestCase):
     def test_launch_count_rejects_non_graph(self):
         with self.assertRaisesRegex(TypeError, "Warp Graph"):
@@ -450,6 +619,10 @@ class TestCaptureLaunches(unittest.TestCase):
     def test_cpu_recording_rejected(self):
         with self.assertRaisesRegex(ValueError, "CUDA capture"):
             wp.capture_begin(device="cpu", record_launches=True)
+
+    def test_memory_recording_requires_launches(self):
+        with self.assertRaisesRegex(ValueError, "record_launches=True"):
+            wp.capture_begin(device="cpu", record_memory_operations=True)
 
 
 for test_func in (
@@ -471,6 +644,13 @@ for test_func in (
     test_overlapping_recording_fails_closed,
     test_deterministic_command_rejected,
     test_paused_capture_prefix,
+    test_captured_memory_values,
+    test_captured_memory_strided_rows,
+    test_captured_memory_zero_and_noops,
+    test_captured_memory_owners_and_snapshots,
+    test_captured_memory_rejects_unsupported,
+    test_captured_memory_streams_and_conditions,
+    test_captured_memory_rejects_stale_array_abi,
 ):
     add_function_test(TestCaptureLaunches, test_func.__name__, test_func, devices=get_selected_cuda_test_devices())
 

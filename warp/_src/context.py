@@ -6013,6 +6013,40 @@ class CapturedLaunch:
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
+class CapturedFill:
+    """A captured whole-array fill and its immutable original operand facts.
+
+    ``array_descriptor`` contains the original array's packed Warp descriptor;
+    ``value_bytes`` is one complete typed element. The canonical launch owns
+    borrowed transfer views, which retain the original array. Its leading launch
+    axis is the original array's leading row axis. This record grants no backing
+    accessibility or execution-count semantics.
+    """
+
+    launch: CapturedLaunch
+    array_dtype: type
+    array_descriptor: bytes
+    value_bytes: bytes
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class CapturedCopy:
+    """A captured whole-array copy with immutable original operand descriptors.
+
+    The canonical launch retains both original arrays through its borrowed
+    transfer views. Descriptor bytes, rather than mutable owner attributes,
+    describe the operands that were recorded. Its leading launch axis is the
+    shared leading row axis of both arrays.
+    """
+
+    launch: CapturedLaunch
+    destination_dtype: type
+    destination_descriptor: bytes
+    source_dtype: type
+    source_descriptor: bytes
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
 class CapturedConditionalBody:
     """Exact containment returned when CUDA creates a conditional node's body.
 
@@ -6047,6 +6081,8 @@ class Graph:
         self.capture_id = capture_id
         self._record_launches = False
         self._captured_launches: list[CapturedLaunch] = []
+        self._record_memory_operations = False
+        self._captured_memory_operations: list[CapturedFill | CapturedCopy] = []
         self._captured_conditional_bodies: list[CapturedConditionalBody] = []
         self._launch_recording_incomplete = False
         self._capture_error: str | None = None
@@ -10701,6 +10737,14 @@ def _capture_for_stream(stream):
     return None
 
 
+def _capture_memory_graph(device, stream=None):
+    """Return the explicit memory-lowering capture on the operation's stream."""
+    if not device.is_cuda or not runtime.captures:
+        return None
+    graph = _capture_for_stream(stream or device.stream)
+    return graph if graph is not None and graph._record_memory_operations else None
+
+
 def _begin_launch_recording(device, stream):
     if not runtime.captures:
         return None
@@ -12898,6 +12942,20 @@ def capture_get_launches(graph: Graph) -> tuple[CapturedLaunch, ...]:
     return tuple(graph._captured_launches)
 
 
+def capture_get_memory_operations(graph: Graph) -> tuple[CapturedFill | CapturedCopy, ...]:
+    """Return canonical memory-operation facts while the recorded capture is inactive.
+
+    Requires opt-in ``record_memory_operations=True`` at capture creation; other
+    captures return an empty tuple. Records reference the exact launch objects
+    also returned by :func:`capture_get_launches`. Zero-sized operations and exact
+    self-copies emit no work and therefore have no records.
+    """
+    _validate_capture(graph)
+    if any(graph is active for active in runtime.captures.values()):
+        raise RuntimeError("Pause or finish graph capture before inspecting memory operations")
+    return tuple(graph._captured_memory_operations)
+
+
 def capture_get_conditional_bodies(graph: Graph) -> tuple[CapturedConditionalBody, ...]:
     """Return immutable conditional containment facts after recorded capture ends.
 
@@ -12964,6 +13022,7 @@ def capture_begin(
     apic: bool = False,
     capture_mode: CaptureMode = CaptureMode.THREAD_LOCAL,
     record_launches: bool = False,
+    record_memory_operations: bool = False,
 ):
     """Begin capture of a graph.
 
@@ -12996,6 +13055,14 @@ def capture_begin(
         record_launches: Retain immutable CUDA kernel launch records on the graph.
           Supports forward, unclustered, nondeterministic launches without APIC.
           Call :func:`capture_get_launches` after capture to inspect them.
+        record_memory_operations: Lower supported whole-array fills and copies to
+          patchable kernels, retaining immutable operand facts. Requires
+          ``record_launches=True``. Regular scalar/vector/matrix arrays with
+          contiguous inner dimensions and nonoverlapping positive row strides
+          are supported; fill elements are at most 128 bytes. Copies require
+          equal shapes and element byte sizes on the captured CUDA device.
+          Partial copies, overlapping payloads, indexed arrays and autodiff
+          arrays are rejected. No allocation or execution-count inference occurs.
         capture_mode: The :class:`~warp.CaptureMode` (i.e.
           ``cudaStreamCaptureMode``) used when Warp opens the capture.
           Defaults to :attr:`CaptureMode.THREAD_LOCAL`. Use
@@ -13012,6 +13079,8 @@ def capture_begin(
 
     if record_launches and (device.is_cpu or apic):
         raise ValueError("Kernel launch records require CUDA capture without APIC")
+    if record_memory_operations and not record_launches:
+        raise ValueError("Memory operation records require record_launches=True")
 
     # Reject nested captures
     if runtime._apic_capture is not None:
@@ -13057,6 +13126,11 @@ def capture_begin(
     if stream is None:
         stream = device.stream
 
+    if record_memory_operations:
+        from warp._src import capture_memory  # noqa: PLC0415
+
+        load_module(capture_memory, device=device)
+
     # Create APIC recording state if requested
     apic_capture = None
     if apic:
@@ -13091,6 +13165,7 @@ def capture_begin(
     capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
     graph = Graph(device, capture_id)
     graph._record_launches = record_launches
+    graph._record_memory_operations = record_memory_operations
 
     # Attach APIC capture state if recording
     if apic_capture is not None:
@@ -14259,6 +14334,15 @@ def copy(
 
     if not warp._src.types.is_array(src) or not warp._src.types.is_array(dest):
         raise RuntimeError("Copy source and destination must be arrays")
+
+    operation_device = stream.device if stream is not None else (dest.device if dest.device.is_cuda else src.device)
+    memory_graph = _capture_memory_graph(operation_device, stream)
+    if memory_graph is None and src.device != dest.device:
+        memory_graph = _capture_memory_graph(src.device) or _capture_memory_graph(dest.device)
+    if memory_graph is not None:
+        from warp._src import capture_memory  # noqa: PLC0415
+
+        return capture_memory.copy(memory_graph, dest, src, dest_offset, src_offset, count, stream)
 
     # Validate the offsets and count before any pointer arithmetic or device work.
     # operator.index() accepts Python and NumPy integers and rejects non-integers

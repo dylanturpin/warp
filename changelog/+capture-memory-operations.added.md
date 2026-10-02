@@ -1,0 +1,1 @@
+Add opt-in CUDA graph capture of ordinary full-array fills and copies as patchable kernels, with immutable original operand records available through `capture_get_memory_operations()`. Enable `record_memory_operations=True` together with `record_launches=True`; ordinary capture and eager execution retain their existing paths.
