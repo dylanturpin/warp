@@ -1143,6 +1143,7 @@ WP_API int wp_cuda_stream_is_capturing(void* stream) { return 0; }
 WP_API int wp_cuda_stream_is_blocking(void* stream) { return 0; }
 WP_API int wp_cuda_thread_exchange_capture_mode(int mode) { return mode; }
 WP_API uint64_t wp_cuda_stream_get_capture_id(void* stream) { return 0; }
+WP_API bool wp_cuda_capture_get_kernel_node(void* stream, void** graph, void** node) { return false; }
 WP_API int wp_cuda_stream_get_priority(void* stream) { return 0; }
 
 WP_API void* wp_cuda_event_create(void* context, unsigned flags) { return NULL; }

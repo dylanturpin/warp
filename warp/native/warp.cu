@@ -3374,6 +3374,32 @@ int wp_cuda_thread_exchange_capture_mode(int mode)
 
 uint64_t wp_cuda_stream_get_capture_id(void* stream) { return get_capture_id(static_cast<CUstream>(stream)); }
 
+bool wp_cuda_capture_get_kernel_node(void* stream, void** graph_out, void** node_out)
+{
+    CUstreamCaptureStatus status;
+    CUgraph graph;
+    const CUgraphNode* dependencies;
+    size_t count;
+    if (!check_cu(
+            cuStreamGetCaptureInfo_f(static_cast<CUstream>(stream), &status, nullptr, &graph, &dependencies, &count)
+        ))
+        return false;
+    if (status != CU_STREAM_CAPTURE_STATUS_ACTIVE || !graph || count != 1 || !dependencies) {
+        wp::set_error_string("Warp error: recorded launch must have one immediate capture dependency");
+        return false;
+    }
+    CUgraphNodeType type;
+    if (!check_cu(cuGraphNodeGetType_f(dependencies[0], &type)))
+        return false;
+    if (type != CU_GRAPH_NODE_TYPE_KERNEL) {
+        wp::set_error_string("Warp error: recorded launch dependency is not a kernel node");
+        return false;
+    }
+    *graph_out = graph;
+    *node_out = dependencies[0];
+    return true;
+}
+
 int wp_cuda_stream_get_priority(void* stream)
 {
     int priority = 0;

@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import collections
 import ctypes
+import dataclasses
 import enum
 import functools
 import hashlib
@@ -5988,6 +5989,29 @@ def _validate_cuda_arch_suffix(
 DeviceLike = Device | str | None
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class CapturedLaunch:
+    """Immutable facts about one emitted CUDA kernel, owned by its captured Graph.
+
+    ``dim`` is the compiled bounds shape; ``parameter_bytes[0]`` also preserves
+    the effective thread count and coordinate multiplier. Remaining packets are
+    in kernel argument order. ``argument_owners`` retain resources independently
+    of these snapshots and must not be interpreted as captured descriptors.
+    Handles identify the exact node and its immediate graph, including bodies
+    of conditional nodes. This record declares no execution-count semantics.
+    """
+
+    kernel: Kernel
+    dim: tuple[int, ...]
+    node_handle: int
+    graph_handle: int
+    parameter_bytes: tuple[bytes, ...]
+    argument_owners: tuple[Any, ...]
+    block_dim: int
+    max_blocks: int
+    grid_stride: bool
+
+
 class Graph:
     """A handle to a captured graph of Warp operations.
 
@@ -6007,6 +6031,11 @@ class Graph:
     def __init__(self, device: Device, capture_id: int = 0):
         self.device = device
         self.capture_id = capture_id
+        self._record_launches = False
+        self._captured_launches: list[CapturedLaunch] = []
+        self._launch_recording_incomplete = False
+        self._capture_error: str | None = None
+        self._preparation_owners: list[Any] = []
         self.module_execs: set[ModuleExec] = set()
         self._deterministic_buffer_refs: list[Any] = []
         self.graph_exec: ctypes.c_void_p | None = None
@@ -7665,6 +7694,12 @@ class Runtime:
             self.core.wp_cuda_thread_exchange_capture_mode.restype = ctypes.c_int
             self.core.wp_cuda_stream_get_capture_id.argtypes = [ctypes.c_void_p]
             self.core.wp_cuda_stream_get_capture_id.restype = ctypes.c_uint64
+            self.core.wp_cuda_capture_get_kernel_node.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            self.core.wp_cuda_capture_get_kernel_node.restype = ctypes.c_bool
             self.core.wp_cuda_stream_get_priority.argtypes = [ctypes.c_void_p]
             self.core.wp_cuda_stream_get_priority.restype = ctypes.c_int
 
@@ -10642,6 +10677,77 @@ def _raise_cuda_launch_error(kernel: Kernel, device: Device, hooks: KernelHooks,
     raise RuntimeError(f"Error launching kernel: {kernel.key} on device {device}: {err}")
 
 
+def _capture_for_stream(stream):
+    if runtime.captures and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
+        return runtime.captures.get(runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream))
+    return None
+
+
+def _begin_launch_recording(device, stream):
+    if not runtime.captures:
+        return None
+    graph = _capture_for_stream(stream or device.stream) if device.is_cuda else None
+    if graph is None or not graph._record_launches:
+        return None
+    if graph._launch_recording_incomplete:
+        capture_invalidate(graph, "Recorded launch overlapped an incomplete operation")
+    _validate_capture(graph)
+    # A failed operation leaves this latch set, even if its exception is caught
+    # inside capture. Clear it only after the entire launch has succeeded.
+    graph._launch_recording_incomplete = True
+    return graph
+
+
+def _capture_launch_arguments(kernel, params, args, device):
+    if args is None or len(args) != len(kernel.adj.args):
+        raise RuntimeError("Recorded launches require retained argument owners")
+    owners = []
+
+    def retain(value):
+        if isinstance(value, warp._src.codegen.StructInstance):
+            for name in value._cls.vars:
+                retain(getattr(value, name))
+        elif isinstance(value, warp.array):
+            owners.append(value)
+        elif warp._src.types.is_array(value):
+            raise RuntimeError("Recorded launches currently require regular Warp arrays")
+        elif hasattr(value, "__cuda_array_interface__"):
+            raise RuntimeError("Recorded launches currently require regular Warp array owners")
+        elif isinstance(value, (Texture1D, Texture2D, Texture3D, ctypes.Structure)):
+            raise RuntimeError("Recorded launches do not support texture or raw ctypes resource arguments")
+
+    for arg, value, param in zip(kernel.adj.args, args, params[1:], strict=True):
+        if warp._src.types.is_array(arg.type) or isinstance(arg.type, warp._src.codegen.Struct):
+            if value is not None and isinstance(value, ctypes.Structure):
+                raise RuntimeError("Recorded launches require array and struct owners, not raw ctypes descriptors")
+            packed = pack_arg(kernel, arg.type, arg.label, value, device)
+            if bytes(packed) != bytes(param):
+                raise RuntimeError("Recorded launch argument descriptor changed since command preparation")
+        retain(value)
+    return tuple(bytes(param) for param in params), tuple(owners)
+
+
+def _record_captured_launch(graph, kernel, bounds, packets, owners, stream, block_dim, max_blocks, grid_stride):
+    native_graph, node = ctypes.c_void_p(), ctypes.c_void_p()
+    if not runtime.core.wp_cuda_capture_get_kernel_node(
+        stream.cuda_stream, ctypes.byref(native_graph), ctypes.byref(node)
+    ):
+        raise RuntimeError(runtime.get_error_string())
+    graph._captured_launches.append(
+        CapturedLaunch(
+            kernel,
+            tuple(bounds.shape),
+            node.value,
+            native_graph.value,
+            packets,
+            owners,
+            block_dim,
+            max_blocks,
+            grid_stride,
+        )
+    )
+
+
 class Launch:
     """Represent all data required for a kernel launch so that launches can be replayed quickly.
 
@@ -10961,6 +11067,12 @@ class Launch:
         Args:
             stream: The stream to launch on.
         """
+        recording = _begin_launch_recording(self.device, stream)
+        if recording is not None:
+            det_meta = self.hooks.det_launch_meta
+            if self.adjoint or self.cluster_dim > 1 or (det_meta is not None and det_meta.needs_deterministic):
+                raise RuntimeError("Recorded launches require unclustered, nondeterministic forward kernels")
+            packets, owners = _capture_launch_arguments(self.kernel, self.params, self.fwd_args, self.device)
         apic_capture = _get_apic_capture_for_device(self.device)
         if self.device.is_cpu:
             if apic_capture is not None:
@@ -11039,6 +11151,21 @@ class Launch:
                     apic_info_ptr,
                 ):
                     _raise_cuda_launch_error(self.kernel, self.device, self.hooks, False)
+
+        if recording is not None:
+            if self.bounds.size:
+                _record_captured_launch(
+                    recording,
+                    self.kernel,
+                    self.bounds,
+                    packets,
+                    owners,
+                    stream,
+                    self.block_dim,
+                    self.max_blocks,
+                    self.grid_stride,
+                )
+            recording._launch_recording_incomplete = False
 
 
 def _cuda_grid_blocks(total_dim_size: int, block_dim: int) -> int:
@@ -11248,6 +11375,10 @@ def launch(
     else:
         device = runtime.get_device(device)
 
+    recording = _begin_launch_recording(device, stream)
+    if recording is not None and adjoint:
+        raise RuntimeError("Recorded launches require forward kernels")
+
     if device == "cpu":
         block_dim = 1
     elif block_dim <= 0:
@@ -11292,6 +11423,8 @@ def launch(
         module_exec = kernel.module.load(device, block_dim)
 
         if not module_exec:
+            if recording is not None:
+                raise RuntimeError("Cannot record a launch without a loaded kernel module")
             return
 
         if not kernel.grid_stride and not device.is_cpu:
@@ -11337,6 +11470,10 @@ def launch(
         # deterministic buffers. Backward kernels use the same path so generated
         # tape adjoints can reduce gradient atomics in a fixed order.
         det_meta = hooks.det_launch_meta
+        if recording is not None:
+            if hooks.cluster_dim > 1 or (det_meta is not None and det_meta.needs_deterministic):
+                raise RuntimeError("Recorded launches do not support clustered or deterministic kernels")
+            packets, owners = _capture_launch_arguments(kernel, params, fwd_args, device)
         counter_replay_targets = getattr(det_meta, "counter_replay_targets", ())
         if adjoint and det_meta is not None and det_meta.needs_deterministic and counter_replay_targets:
             target_names = ", ".join(target.target_label for target in counter_replay_targets)
@@ -11501,6 +11638,8 @@ def launch(
                         fwd_args=fwd_args,
                         adj_args=adj_args,
                     )
+                    if recording is not None:
+                        recording._launch_recording_incomplete = False
                     return launch
                 else:
                     # Build APIC info if a CUDA APIC capture is active so the
@@ -11554,6 +11693,8 @@ def launch(
                         block_dim=block_dim,
                         fwd_args=fwd_args,
                     )
+                    if recording is not None:
+                        recording._launch_recording_incomplete = False
                     return launch
                 else:
                     # Build APIC info if CUDA APIC capture is active
@@ -11584,6 +11725,10 @@ def launch(
                     ):
                         _raise_cuda_launch_error(kernel, device, hooks, False)
 
+            if recording is not None:
+                _record_captured_launch(
+                    recording, kernel, bounds, packets, owners, stream, block_dim, max_blocks, kernel.grid_stride
+                )
             try:
                 runtime.verify_cuda_device(device)
             except Exception as e:
@@ -11602,6 +11747,9 @@ def launch(
         # detect illegal inter-kernel read/write access patterns if verification flag is set
         if warp.config.verify_autograd_array_access:
             runtime.tape._check_kernel_array_access(kernel, fwd_args)
+
+    if recording is not None:
+        recording._launch_recording_incomplete = False
 
 
 def launch_tiled(*args, **kwargs):
@@ -11631,37 +11779,50 @@ def launch_tiled(*args, **kwargs):
             ...
     """
 
-    # promote dim to a list in case it was passed as a scalar or tuple
-    if "dim" not in kwargs:
-        raise RuntimeError("Launch dimensions 'dim' argument should be passed via. keyword args for wp.launch_tiled()")
+    graph = None
+    if runtime is not None and runtime.captures:
+        stream = kwargs.get("stream")
+        device = stream.device if stream is not None else runtime.get_device(kwargs.get("device"))
+        graph = _capture_for_stream(stream or device.stream) if device.is_cuda else None
+    try:
+        # promote dim to a list in case it was passed as a scalar or tuple
+        if "dim" not in kwargs:
+            raise RuntimeError(
+                "Launch dimensions 'dim' argument should be passed via. keyword args for wp.launch_tiled()"
+            )
 
-    if "block_dim" not in kwargs:
-        raise RuntimeError(
-            "Launch block dimension 'block_dim' argument should be passed via. keyword args for wp.launch_tiled()"
-        )
+        if "block_dim" not in kwargs:
+            raise RuntimeError(
+                "Launch block dimension 'block_dim' argument should be passed via. keyword args for wp.launch_tiled()"
+            )
 
-    if "device" in kwargs:
-        device = kwargs["device"]
-    else:
-        # todo: this doesn't consider the case where device
-        # is passed through positional args
-        device = None
+        if "device" in kwargs:
+            device = kwargs["device"]
+        else:
+            # todo: this doesn't consider the case where device
+            # is passed through positional args
+            device = None
 
-    # force the block_dim to 1 if running on "cpu"
-    device = runtime.get_device(device)
-    if device.is_cpu:
-        kwargs["block_dim"] = 1
+        # force the block_dim to 1 if running on "cpu"
+        device = runtime.get_device(device)
+        if device.is_cpu:
+            kwargs["block_dim"] = 1
 
-    dim = _canonicalize_dim(kwargs["dim"])
+        dim = _canonicalize_dim(kwargs["dim"])
 
-    if len(dim) > 3:
-        raise RuntimeError("wp.launch_tiled() requires a grid with fewer than 4 dimensions")
+        if len(dim) > 3:
+            raise RuntimeError("wp.launch_tiled() requires a grid with fewer than 4 dimensions")
 
-    # add trailing dimension
-    kwargs["dim"] = [*dim, kwargs["block_dim"]]
+        # add trailing dimension
+        kwargs["dim"] = [*dim, kwargs["block_dim"]]
 
-    # forward to original launch method
-    return launch(*args, **kwargs)
+        # forward to original launch method
+        return launch(*args, **kwargs)
+
+    except Exception:
+        if graph is not None and graph._record_launches:
+            capture_invalidate(graph, "Tiled kernel launch failed")
+        raise
 
 
 def _resolve_cuda_kernel_forward_entry_point(kernel, device, block_dim, api_name):
@@ -12681,6 +12842,76 @@ def _get_apic_capture_for_device(device: Device) -> APICapture | None:
     return None
 
 
+def _validate_capture(graph, *, prepared=False):
+    if not isinstance(graph, Graph):
+        raise TypeError("Expected a Warp Graph")
+    if graph._capture_error is not None:
+        raise RuntimeError(f"Graph is invalid: {graph._capture_error}")
+    if graph._launch_recording_incomplete:
+        raise RuntimeError("Graph contains an incomplete recorded launch")
+    if prepared and graph._preparation_owners:
+        raise RuntimeError("Graph has unresolved preparation requirements")
+
+
+def capture_get_launches(graph: Graph) -> tuple[CapturedLaunch, ...]:
+    """Return the graph's canonical immutable launch records while capture is inactive.
+
+    A paused capture exposes its recorded prefix; resuming may append records.
+    Consumers that prepare a complete program must finish capture and must not
+    resume it after binding. Preparation requirements do not block inspection.
+    A graph captured without ``record_launches=True`` returns an empty tuple.
+    """
+    _validate_capture(graph)
+    if any(graph is active for active in runtime.captures.values()):
+        raise RuntimeError("Pause or finish graph capture before inspecting launch records")
+    return tuple(graph._captured_launches)
+
+
+def capture_invalidate(graph: Graph, reason: str) -> None:
+    """Permanently prevent graph replay after capture or consumer preparation fails."""
+    if not isinstance(graph, Graph):
+        raise TypeError("Expected a Warp Graph")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("Graph invalidation requires a nonempty reason")
+    if graph._capture_error is None:
+        graph._capture_error = reason
+
+
+def capture_require_preparation(graph: Graph, owner: Any) -> None:
+    """Block replay until this exact owner's external preparation completes.
+
+    The graph retains owners by identity without invoking their methods. Multiple
+    independent owners may register before graph instantiation; repeated
+    registration of the same pending owner is idempotent.
+    """
+    _validate_capture(graph)
+    if graph.graph_exec is not None or graph._native_graph is not None:
+        raise RuntimeError("Cannot add preparation requirements to an instantiated graph")
+    if not any(owner is existing for existing in graph._preparation_owners):
+        graph._preparation_owners.append(owner)
+
+
+def capture_complete_preparation(graph: Graph, owner: Any) -> None:
+    """Discharge one registered preparation obligation by exact owner identity."""
+    _validate_capture(graph)
+    for index, existing in enumerate(graph._preparation_owners):
+        if owner is existing:
+            del graph._preparation_owners[index]
+            return
+    raise ValueError("Preparation owner was not registered on this graph")
+
+
+def _validate_capture_insertion(graph, parent):
+    try:
+        _validate_capture(graph, prepared=True)
+        if parent is not None and parent._record_launches:
+            raise RuntimeError("Recorded capture cannot insert prebuilt graphs; use callable bodies")
+    except Exception as error:
+        if parent is not None:
+            capture_invalidate(parent, str(error))
+        raise
+
+
 def capture_begin(
     device: DeviceLike = None,
     stream: Stream | None = None,
@@ -12688,6 +12919,7 @@ def capture_begin(
     external: bool = False,
     apic: bool = False,
     capture_mode: CaptureMode = CaptureMode.THREAD_LOCAL,
+    record_launches: bool = False,
 ):
     """Begin capture of a graph.
 
@@ -12717,6 +12949,9 @@ def capture_begin(
           CUDA this also enables APIC operation-stream recording during the
           capture; on CPU, recording happens regardless because it is the only
           replay mechanism.
+        record_launches: Retain immutable CUDA kernel launch records on the graph.
+          Supports forward, unclustered, nondeterministic launches without APIC.
+          Call :func:`capture_get_launches` after capture to inspect them.
         capture_mode: The :class:`~warp.CaptureMode` (i.e.
           ``cudaStreamCaptureMode``) used when Warp opens the capture.
           Defaults to :attr:`CaptureMode.THREAD_LOCAL`. Use
@@ -12730,6 +12965,9 @@ def capture_begin(
         device = stream.device
     else:
         device = runtime.get_device(device)
+
+    if record_launches and (device.is_cpu or apic):
+        raise ValueError("Kernel launch records require CUDA capture without APIC")
 
     # Reject nested captures
     if runtime._apic_capture is not None:
@@ -12808,6 +13046,7 @@ def capture_begin(
 
     capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
     graph = Graph(device, capture_id)
+    graph._record_launches = record_launches
 
     # Attach APIC capture state if recording
     if apic_capture is not None:
@@ -13183,6 +13422,13 @@ def capture_if(
 
         return
 
+    parent = _capture_for_stream(stream)
+    if parent is not None:
+        _validate_capture(parent)
+    for child in (on_true, on_false):
+        if isinstance(child, Graph):
+            _validate_capture_insertion(child, parent)
+
     # ensure conditional graph nodes are supported
     assert_conditional_graph_support()
 
@@ -13292,6 +13538,8 @@ def capture_if(
             if not runtime.core.wp_cuda_graph_check_conditional_body(graph_on_false):
                 raise RuntimeError(runtime.get_error_string())
     except Exception:
+        if main_graph._record_launches or main_graph._preparation_owners:
+            capture_invalidate(main_graph, "Conditional graph capture failed")
         # Roll back any branch begun-but-not-ended (so its partial ops leave the main
         # stream) and free the extracted bodies, so APIC branch state does not leak.
         if apic_recording:
@@ -13403,6 +13651,12 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
 
         return
 
+    parent = _capture_for_stream(stream)
+    if parent is not None:
+        _validate_capture(parent)
+    if isinstance(while_body, Graph):
+        _validate_capture_insertion(while_body, parent)
+
     # ensure conditional graph nodes are supported
     assert_conditional_graph_support()
 
@@ -13491,6 +13745,8 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
         if not runtime.core.wp_cuda_graph_check_conditional_body(body_graph):
             raise RuntimeError(runtime.get_error_string())
     except Exception:
+        if main_graph._record_launches or main_graph._preparation_owners:
+            capture_invalidate(main_graph, "Conditional graph capture failed")
         # Mirror capture_if: don't leak the recorded branch body on failure. If
         # the body was begun but not ended (e.g. while_body raised), end it now
         # so the partial branch ops are rolled back out of the main stream, then
@@ -13540,6 +13796,9 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
           :func:`~warp.capture_load()`.
         stream: A :class:`Stream` to launch the graph on (CUDA only)
     """
+
+    parent = _capture_for_stream(stream or graph.device.stream) if graph.device.is_cuda else runtime._apic_graph
+    _validate_capture_insertion(graph, parent)
 
     # ---- APIC loaded graph path ----
     if graph._native_graph is not None:

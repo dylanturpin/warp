@@ -2010,6 +2010,10 @@ def launch_deterministic(
     )
 
     runtime = warp_context.runtime
+    graph = warp_context._capture_for_stream(stream or device.stream)
+    if graph is not None and graph._record_launches:
+        warp_context.capture_invalidate(graph, "Recorded launches do not support deterministic kernel expansion")
+        raise RuntimeError("Recorded launches do not support deterministic kernel expansion")
 
     launch_kind = "backward" if adjoint else "forward"
 

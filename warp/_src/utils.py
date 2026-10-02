@@ -1960,6 +1960,7 @@ class ScopedCapture:
         apic: If ``True``, enable API Capture (APIC) recording for serialization via
             :func:`capture_save`. On CPU, recording always occurs regardless
             of this flag (needed for CPU graph replay). Default is ``False``.
+        record_launches: Retain immutable CUDA kernel launch records; see :func:`capture_get_launches`.
         capture_mode: The :class:`~warp.CaptureMode` to use when opening
             the capture. Defaults to :attr:`CaptureMode.THREAD_LOCAL`.
             See :func:`capture_begin` for details.
@@ -1989,6 +1990,7 @@ class ScopedCapture:
         external=False,
         apic: bool = False,
         capture_mode: CaptureMode = CaptureMode.THREAD_LOCAL,
+        record_launches: bool = False,
     ):
         self.device = device
         self.stream = stream
@@ -1996,6 +1998,7 @@ class ScopedCapture:
         self.external = external
         self.apic = apic
         self.capture_mode = capture_mode
+        self.record_launches = record_launches
         self.active = False
         self.graph = None
 
@@ -2008,6 +2011,7 @@ class ScopedCapture:
                 external=self.external,
                 apic=self.apic,
                 capture_mode=self.capture_mode,
+                record_launches=self.record_launches,
             )
             self.active = True
             return self
@@ -2018,6 +2022,8 @@ class ScopedCapture:
         if self.active:
             try:
                 self.graph = wp.capture_end(device=self.device, stream=self.stream)
+                if exc_type is not None and self.record_launches:
+                    wp.capture_invalidate(self.graph, "Captured scope raised an exception")
             except Exception:
                 # Only report this exception if __exit__() was reached without an exception,
                 # otherwise re-raise the original exception.

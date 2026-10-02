@@ -97,6 +97,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     # their kernels only after that point.
     from warp.tests.cuda.test_array_fill_capture import TestArrayFillCapture
     from warp.tests.cuda.test_async import TestAsync
+    from warp.tests.cuda.test_capture_launches import TestCaptureLaunches
     from warp.tests.cuda.test_capture_mode import TestCaptureMode
     from warp.tests.cuda.test_clang_cuda import TestClangCUDA
     from warp.tests.cuda.test_cluster_dim import TestClusterDim
@@ -313,6 +314,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestBuiltinsResolution,
         TestBvh,
         TestCaptureMode,
+        TestCaptureLaunches,
         TestClangCUDA,
         TestClosestPointEdgeEdgeMethods,
         TestClusterDim,
@@ -525,6 +527,7 @@ def debug_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
     # test kernels before a focused debug suite is selected.
     from warp.tests.aot.test_module_aot import TestModuleAOT
     from warp.tests.cuda.test_array_fill_capture import TestArrayFillCapture
+    from warp.tests.cuda.test_capture_launches import TestCaptureLaunches
     from warp.tests.cuda.test_capture_mode import TestCaptureMode
     from warp.tests.cuda.test_clang_cuda import TestClangCUDA
     from warp.tests.cuda.test_cluster_dim import TestClusterDim
@@ -796,6 +799,7 @@ def debug_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
         TestModuleAOT,
         TestArrayFillCapture,
         TestCaptureMode,
+        TestCaptureLaunches,
         TestClangCUDA,
         TestClusterDim,
         TestConditionalCaptures,
