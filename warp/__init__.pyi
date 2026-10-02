@@ -186,7 +186,10 @@ from warp._src.utils import ScopedCapture as ScopedCapture
 from warp._src.context import is_conditional_graph_supported as is_conditional_graph_supported
 from warp._src.context import Graph as Graph
 from warp._src.context import CapturedLaunch as CapturedLaunch
+from warp._src.context import capture_launch_count as capture_launch_count
+from warp._src.context import CapturedConditionalBody as CapturedConditionalBody
 from warp._src.context import capture_get_launches as capture_get_launches
+from warp._src.context import capture_get_conditional_bodies as capture_get_conditional_bodies
 from warp._src.context import capture_invalidate as capture_invalidate
 from warp._src.context import capture_require_preparation as capture_require_preparation
 from warp._src.context import capture_complete_preparation as capture_complete_preparation

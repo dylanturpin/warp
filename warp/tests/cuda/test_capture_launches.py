@@ -187,8 +187,44 @@ def test_conditional_body_records(test, device):
         test.assertEqual(len(records), 2)
         test.assertTrue(all(r.graph_handle != capture.graph.graph.value for r in records))
         test.assertNotEqual(records[0].graph_handle, records[1].graph_handle)
+        bodies = wp.capture_get_conditional_bodies(capture.graph)
+        test.assertEqual(len(bodies), 2)
+        test.assertEqual({body.body_graph_handle for body in bodies}, {record.graph_handle for record in records})
+        test.assertTrue(all(body.graph_handle == capture.graph.graph.value and body.node_handle for body in bodies))
+        test.assertIs(wp.capture_get_conditional_bodies(capture.graph)[0], bodies[0])
+        with test.assertRaises(dataclasses.FrozenInstanceError):
+            bodies[0].body_graph_handle = 0
         wp.capture_launch(capture.graph)
         np.testing.assert_allclose(values.numpy(), 17)
+
+
+def test_nested_conditional_containment(test, device):
+    if not wp.is_conditional_graph_supported():
+        test.skipTest("Conditional graphs require CUDA 12.4+")
+    with wp.ScopedDevice(device):
+        values = wp.zeros(1, dtype=int)
+        outer, condition = wp.ones(1, dtype=int), wp.ones(1, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_if(
+                outer,
+                lambda: wp.capture_while(condition, lambda: wp.launch(stop_loop, 1, [condition, values])),
+                lambda: wp.launch(write_value, 1, [values, 29]),
+            )
+        bodies = wp.capture_get_conditional_bodies(capture.graph)
+        test.assertEqual(len(bodies), 3)
+        test.assertEqual(len({body.body_graph_handle for body in bodies}), 3)
+        roots = [body for body in bodies if body.graph_handle == capture.graph.graph.value]
+        test.assertEqual(len(roots), 2)
+        nested = next(body for body in bodies if body not in roots)
+        test.assertIn(nested.graph_handle, {body.body_graph_handle for body in roots})
+        loop_record = next(record for record in wp.capture_get_launches(capture.graph) if record.kernel is stop_loop)
+        test.assertEqual(loop_record.graph_handle, nested.body_graph_handle)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_allclose(values.numpy(), 17)
+        outer.zero_()
+        wp.capture_launch(capture.graph)
+        np.testing.assert_allclose(values.numpy(), 29)
 
 
 def test_caught_launch_failure(test, device):
@@ -363,12 +399,42 @@ def test_paused_capture_prefix(test, device):
         np.testing.assert_allclose(values.numpy(), 3)
 
 
+def test_capture_launch_count(test, device):
+    with wp.ScopedDevice(device):
+        values = wp.zeros(1, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            active = device.captures[wp.get_stream(device)]
+            test.assertEqual(wp.capture_launch_count(active), 0)
+            with test.assertRaisesRegex(RuntimeError, "finish graph capture"):
+                wp.capture_get_launches(active)
+            wp.launch(write_value, 0, [values, 1])
+            test.assertEqual(wp.capture_launch_count(active), 0)
+            wp.launch(write_value, 1, [values, 2])
+            start = wp.capture_launch_count(active)
+            test.assertEqual(start, 1)
+            with mock.patch.object(active, "_launch_recording_incomplete", True):
+                with test.assertRaisesRegex(RuntimeError, "incomplete"):
+                    wp.capture_launch_count(active)
+            wp.launch(write_value, 1, [values, 3])
+            end = wp.capture_launch_count(active)
+            test.assertEqual(end, 2)
+        records = wp.capture_get_launches(capture.graph)
+        test.assertEqual(wp.capture_launch_count(capture.graph), len(records))
+        test.assertEqual(len(records[start:end]), 1)
+        test.assertEqual(ctypes.c_int.from_buffer_copy(records[start].parameter_bytes[2]).value, 3)
+        wp.capture_invalidate(capture.graph, "invalid count inspection")
+        with test.assertRaisesRegex(RuntimeError, "invalid count inspection"):
+            wp.capture_launch_count(capture.graph)
+
+
 def test_default_capture_unchanged(test, device):
     with wp.ScopedDevice(device):
         values = wp.zeros(1, dtype=int)
         wp.load_module(device=device)
         with wp.ScopedCapture() as capture:
             wp.launch(write_value, 1, [values, 10])
+        test.assertEqual(wp.capture_launch_count(capture.graph), 0)
         test.assertEqual(wp.capture_get_launches(capture.graph), ())
         wp.capture_launch(capture.graph)
         np.testing.assert_allclose(values.numpy(), 10)
@@ -377,6 +443,10 @@ def test_default_capture_unchanged(test, device):
 
 
 class TestCaptureLaunches(unittest.TestCase):
+    def test_launch_count_rejects_non_graph(self):
+        with self.assertRaisesRegex(TypeError, "Warp Graph"):
+            wp.capture_launch_count(object())
+
     def test_cpu_recording_rejected(self):
         with self.assertRaisesRegex(ValueError, "CUDA capture"):
             wp.capture_begin(device="cpu", record_launches=True)
@@ -389,12 +459,14 @@ for test_func in (
     test_tiled_compiled_bounds,
     test_joined_streams,
     test_conditional_body_records,
+    test_nested_conditional_containment,
     test_caught_launch_failure,
     test_post_emission_failure,
     test_invalidation_after_instantiation,
     test_preparation_obligations,
     test_child_insertion_guards,
     test_command_descriptor_mutation,
+    test_capture_launch_count,
     test_default_capture_unchanged,
     test_overlapping_recording_fails_closed,
     test_deterministic_command_rejected,

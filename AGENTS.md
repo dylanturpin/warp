@@ -70,3 +70,4 @@ Follow Google-style docstrings. Use doctest for code examples where practical.
 - `warp._src.utils` imports `warp._src.context` at module level—importing from `utils` in early-loaded modules (e.g., `texture.py`) causes circular imports. Use lazy imports (`from warp._src.utils import ... # noqa: PLC0415` inside functions) when needed.
 - Use the `DeviceLike` type annotation (from `warp._src.context`) for `device` parameters. In modules where importing it at runtime would create a circular import, import it under `TYPE_CHECKING`.
 - Native bindings use ctypes; function signatures are registered in `Runtime.__init__` in `warp/_src/context.py`.
+- Recorded conditional containment comes from native creation handles and belongs to one passive relation on Graph. Do not infer parent/body relationships from launch order, kernel names, or equal dimensions. Retain immediate graph handles; consumer dependency proofs must check actual CUDA completion edges before entering a body.

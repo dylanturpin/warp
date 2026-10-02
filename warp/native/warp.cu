@@ -4129,7 +4129,15 @@ bool wp_cuda_graph_resume_capture(void* context, void* stream, void* graph)
 // condition is a gpu pointer
 // if_graph_ret and else_graph_ret should be NULL if not needed
 bool wp_cuda_graph_insert_if_else(
-    void* context, void* stream, int arch, bool use_ptx, int* condition, void** if_graph_ret, void** else_graph_ret
+    void* context,
+    void* stream,
+    int arch,
+    bool use_ptx,
+    int* condition,
+    void** if_graph_ret,
+    void** else_graph_ret,
+    void** if_node_ret,
+    void** else_node_ret
 )
 {
     bool has_if = if_graph_ret != NULL;
@@ -4207,6 +4215,11 @@ bool wp_cuda_graph_insert_if_else(
             ))
             return false;
 
+        if (has_if && if_node_ret)
+            *if_node_ret = condition_node;
+        if (has_else && else_node_ret)
+            *else_node_ret = condition_node;
+
         if (num_branches == 1) {
             if (has_if)
                 *if_graph_ret = condition_params.conditional.phGraph_out[0];
@@ -4266,6 +4279,10 @@ bool wp_cuda_graph_insert_if_else(
 
         *if_graph_ret = if_params.conditional.phGraph_out[0];
         *else_graph_ret = else_params.conditional.phGraph_out[0];
+        if (if_node_ret)
+            *if_node_ret = if_node;
+        if (else_node_ret)
+            *else_node_ret = else_node;
     }
 
     return true;
@@ -4418,7 +4435,14 @@ bool wp_cuda_graph_insert_child_graph(void* context, void* stream, void* child_g
 }
 
 bool wp_cuda_graph_insert_while(
-    void* context, void* stream, int arch, bool use_ptx, int* condition, void** body_graph_ret, uint64_t* handle_ret
+    void* context,
+    void* stream,
+    int arch,
+    bool use_ptx,
+    int* condition,
+    void** body_graph_ret,
+    uint64_t* handle_ret,
+    void** body_node_ret
 )
 {
     // if there's no body, it's a no-op
@@ -4483,6 +4507,8 @@ bool wp_cuda_graph_insert_while(
 
     *body_graph_ret = while_params.conditional.phGraph_out[0];
     *handle_ret = handle;
+    if (body_node_ret)
+        *body_node_ret = while_node;
 
     return true;
 }
@@ -4526,7 +4552,15 @@ bool wp_cuda_graph_resume_capture(void* context, void* stream, void* graph)
 }
 
 bool wp_cuda_graph_insert_if_else(
-    void* context, void* stream, int arch, bool use_ptx, int* condition, void** if_graph_ret, void** else_graph_ret
+    void* context,
+    void* stream,
+    int arch,
+    bool use_ptx,
+    int* condition,
+    void** if_graph_ret,
+    void** else_graph_ret,
+    void** if_node_ret,
+    void** else_node_ret
 )
 {
     wp::set_error_string("Warp error: Warp must be built with CUDA Toolkit 12.4+ to enable conditional graph nodes");
@@ -4534,7 +4568,14 @@ bool wp_cuda_graph_insert_if_else(
 }
 
 bool wp_cuda_graph_insert_while(
-    void* context, void* stream, int arch, bool use_ptx, int* condition, void** body_graph_ret, uint64_t* handle_ret
+    void* context,
+    void* stream,
+    int arch,
+    bool use_ptx,
+    int* condition,
+    void** body_graph_ret,
+    uint64_t* handle_ret,
+    void** body_node_ret
 )
 {
     wp::set_error_string("Warp error: Warp must be built with CUDA Toolkit 12.4+ to enable conditional graph nodes");

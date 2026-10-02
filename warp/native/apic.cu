@@ -817,7 +817,7 @@ static bool apic_replay_ops_into_cuda_capture(
             if (!wp_cuda_graph_insert_if_else(
                     graph->cuda_context, (void*)stream, arch, use_ptx, reinterpret_cast<int*>(cond_ptr),
                     rec->branch_a_size > 0 ? &graph_on_true : nullptr,
-                    rec->branch_b_size > 0 ? &graph_on_false : nullptr
+                    rec->branch_b_size > 0 ? &graph_on_false : nullptr, nullptr, nullptr
                 )) {
                 success = false;
                 break;
@@ -876,7 +876,7 @@ static bool apic_replay_ops_into_cuda_capture(
             uint64_t cond_handle = 0;
             if (!wp_cuda_graph_insert_while(
                     graph->cuda_context, (void*)stream, arch, use_ptx, reinterpret_cast<int*>(cond_ptr), &body_graph,
-                    &cond_handle
+                    &cond_handle, nullptr
                 )) {
                 success = false;
                 break;

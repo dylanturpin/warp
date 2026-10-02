@@ -6012,6 +6012,20 @@ class CapturedLaunch:
     grid_stride: bool
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class CapturedConditionalBody:
+    """Exact containment returned when CUDA creates a conditional node's body.
+
+    The parent graph owns ``node_handle``; that node owns ``body_graph_handle``.
+    One Graph retains these creation facts for all nested bodies. They describe
+    containment, not execution ordering between nodes in any one graph.
+    """
+
+    graph_handle: int
+    node_handle: int
+    body_graph_handle: int
+
+
 class Graph:
     """A handle to a captured graph of Warp operations.
 
@@ -6033,6 +6047,7 @@ class Graph:
         self.capture_id = capture_id
         self._record_launches = False
         self._captured_launches: list[CapturedLaunch] = []
+        self._captured_conditional_bodies: list[CapturedConditionalBody] = []
         self._launch_recording_incomplete = False
         self._capture_error: str | None = None
         self._preparation_owners: list[Any] = []
@@ -7757,6 +7772,8 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_int),
                 ctypes.POINTER(ctypes.c_void_p),
                 ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
             ]
             self.core.wp_cuda_graph_insert_if_else.restype = ctypes.c_bool
 
@@ -7768,6 +7785,7 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_int),
                 ctypes.POINTER(ctypes.c_void_p),
                 ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_void_p),
             ]
             self.core.wp_cuda_graph_insert_while.restype = ctypes.c_bool
 
@@ -12853,6 +12871,19 @@ def _validate_capture(graph, *, prepared=False):
         raise RuntimeError("Graph has unresolved preparation requirements")
 
 
+def capture_launch_count(graph: Graph) -> int:
+    """Return the number of completed kernel launch records in constant time.
+
+    May be called during capture between operations. Prefix offsets let a
+    composition root associate its operations with record ranges after capture,
+    without exposing a mutable ledger or implying CUDA execution order.
+    Failed or incomplete recorded operations reject inspection. A graph captured
+    without ``record_launches=True`` has no launch records and returns zero.
+    """
+    _validate_capture(graph)
+    return len(graph._captured_launches)
+
+
 def capture_get_launches(graph: Graph) -> tuple[CapturedLaunch, ...]:
     """Return the graph's canonical immutable launch records while capture is inactive.
 
@@ -12865,6 +12896,19 @@ def capture_get_launches(graph: Graph) -> tuple[CapturedLaunch, ...]:
     if any(graph is active for active in runtime.captures.values()):
         raise RuntimeError("Pause or finish graph capture before inspecting launch records")
     return tuple(graph._captured_launches)
+
+
+def capture_get_conditional_bodies(graph: Graph) -> tuple[CapturedConditionalBody, ...]:
+    """Return immutable conditional containment facts after recorded capture ends.
+
+    Only captures with ``record_launches=True`` retain this relation. Preparation
+    requirements do not block inspection. Body handles and containing node handles
+    come directly from CUDA creation, including the two-node IF/ELSE implementation.
+    """
+    _validate_capture(graph)
+    if any(graph is active for active in runtime.captures.values()):
+        raise RuntimeError("Finish graph capture before inspecting conditional bodies")
+    return tuple(graph._captured_conditional_bodies)
 
 
 def capture_invalidate(graph: Graph, reason: str) -> None:
@@ -13456,6 +13500,8 @@ def capture_if(
     # insert conditional node
     graph_on_true = ctypes.c_void_p()
     graph_on_false = ctypes.c_void_p()
+    node_on_true = ctypes.c_void_p()
+    node_on_false = ctypes.c_void_p()
     if not runtime.core.wp_cuda_graph_insert_if_else(
         device.context,
         stream.cuda_stream,
@@ -13464,13 +13510,23 @@ def capture_if(
         ctypes.cast(condition.ptr, ctypes.POINTER(ctypes.c_int32)),
         None if on_true is None else ctypes.byref(graph_on_true),
         None if on_false is None else ctypes.byref(graph_on_false),
+        None if on_true is None else ctypes.byref(node_on_true),
+        None if on_false is None else ctypes.byref(node_on_false),
     ):
+        if graph._record_launches or graph._preparation_owners:
+            capture_invalidate(graph, "Conditional node creation failed")
         raise RuntimeError(runtime.get_error_string())
 
     # pause capturing parent graph
     main_graph = capture_pause(stream=stream, _suspend_apic_recording=False)
     # store the pointer to the cuda graph to restore it later
     main_graph_ptr = main_graph.graph
+    if main_graph._record_launches:
+        for body, node in ((graph_on_true, node_on_true), (graph_on_false, node_on_false)):
+            if body.value:
+                main_graph._captured_conditional_bodies.append(
+                    CapturedConditionalBody(main_graph_ptr.value, node.value, body.value)
+                )
 
     branch_a = ctypes.c_void_p()
     branch_b = ctypes.c_void_p()
@@ -13682,6 +13738,7 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
     # insert conditional while-node
     body_graph = ctypes.c_void_p()
     cond_handle = ctypes.c_uint64()
+    body_node = ctypes.c_void_p()
     if not runtime.core.wp_cuda_graph_insert_while(
         device.context,
         stream.cuda_stream,
@@ -13690,13 +13747,20 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
         ctypes.cast(condition.ptr, ctypes.POINTER(ctypes.c_int32)),
         ctypes.byref(body_graph),
         ctypes.byref(cond_handle),
+        ctypes.byref(body_node),
     ):
+        if graph._record_launches or graph._preparation_owners:
+            capture_invalidate(graph, "Conditional node creation failed")
         raise RuntimeError(runtime.get_error_string())
 
     # pause capturing parent graph and start capturing child graph
     main_graph = capture_pause(stream=stream, _suspend_apic_recording=False)
     # store the pointer to the cuda graph to restore it later
     main_graph_ptr = main_graph.graph
+    if main_graph._record_launches:
+        main_graph._captured_conditional_bodies.append(
+            CapturedConditionalBody(main_graph_ptr.value, body_node.value, body_graph.value)
+        )
 
     # temporarily repurpose the main_graph python object such that all dependencies
     # added through _retain_module_exec() end up in the correct python graph object

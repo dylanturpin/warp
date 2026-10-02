@@ -1,1 +1,3 @@
 Add opt-in immutable CUDA kernel launch records through `capture_begin(record_launches=True)` and `ScopedCapture(record_launches=True)`. `capture_get_launches()` exposes exact emitted nodes, compiled bounds and packed parameter snapshots with separately retained argument owners. Add fail-closed graph invalidation and identity-based external preparation requirements through `capture_invalidate()`, `capture_require_preparation()` and `capture_complete_preparation()`.
+
+Expose exact nested conditional containment through `capture_get_conditional_bodies()`, using the parent graph, containing node and body graph handles returned during native CUDA creation.
