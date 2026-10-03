@@ -5222,7 +5222,9 @@ bool wp_cuda_compile_solver(
     int arrangement_A,
     int arrangement_B,
     int fill_mode,
-    int num_threads
+    int num_threads,
+    int lda,
+    int ldb
 )
 {
 
@@ -5273,6 +5275,13 @@ bool wp_cuda_compile_solver(
     CHECK_CUSOLVER(cusolverdxSetOperatorInt64s(
         h, cusolverdxOperatorType::CUSOLVERDX_OPERATOR_ARRANGEMENT, arrangement.size(), arrangement.data()
     ));
+    if (lda > 0 && ldb > 0) {
+        std::array<long long int, 2> leading_dimensions = { lda, ldb };
+        CHECK_CUSOLVER(cusolverdxSetOperatorInt64s(
+            h, cusolverdxOperatorType::CUSOLVERDX_OPERATOR_LEADING_DIMENSION, leading_dimensions.size(),
+            leading_dimensions.data()
+        ));
+    }
     CHECK_CUSOLVER(cusolverdxSetOperatorInt64(
         h, cusolverdxOperatorType::CUSOLVERDX_OPERATOR_FILL_MODE, (cusolverdxFillMode)fill_mode
     ));

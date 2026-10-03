@@ -1,0 +1,1 @@
+Fix tile Cholesky and triangular solves on padded or strided shared-memory views by preserving operand leading dimensions in cuSolverDx. Out-of-place tile solver and diagonal-add results now use dense owning storage instead of inheriting borrowed view strides.

@@ -803,6 +803,8 @@ def build_lto_solver(
     parameter_list,
     builder,
     smem_estimate_bytes=None,
+    lda=None,
+    ldb=None,
 ):
     arch = _get_mathdx_arch(arch)
 
@@ -811,12 +813,23 @@ def build_lto_solver(
             return 0  # CUSOLVERDX_ARRANGEMENT_COL_MAJOR
         if layout == "rowmajor":
             return 1  # CUSOLVERDX_ARRANGEMENT_ROW_MAJOR
-        raise ValueError("Unsupported layout in tile_matmul")
+        raise ValueError("Unsupported layout in tile solver")
 
     a_arrangement = cusolverdx_arrangement_map(alayout)
     b_arrangement = cusolverdx_arrangement_map(blayout)
 
+    # POTRF/POTRS use a square factor and POTRS stores its RHS count in K.
+    # TRSM uses an M x N RHS. All current triangular solves act from the left.
+    rhs_columns = K if solver == "potrs" else N
+    dense_lds = (M, rhs_columns if blayout == "rowmajor" else M)
+    lda = dense_lds[0] if lda is None else lda
+    ldb = dense_lds[1] if ldb is None else ldb
+    native_lds = (0, 0) if (lda, ldb) == dense_lds else (lda, ldb)
+
     lto_symbol = f"{solver}_{M}_{N}_{K}_{arch}_{num_threads}_{a_arrangement}_{b_arrangement}_{precision_enum}_{side_enum if side_enum >= 0 else 'x'}_{diag_enum if diag_enum >= 0 else 'x'}_{fill_mode}"
+
+    if (lda, ldb) != dense_lds:
+        lto_symbol += f"_{lda}_{ldb}"
 
     def compile_lto_solver(temp_paths):
         # compile LTO
@@ -839,6 +852,8 @@ def build_lto_solver(
             b_arrangement,
             fill_mode,
             num_threads,
+            native_lds[0],
+            native_lds[1],
         )
 
         if result:

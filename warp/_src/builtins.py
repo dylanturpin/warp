@@ -18041,7 +18041,7 @@ def tile_diag_add_value_func(arg_types, arg_values):
         )
 
     # use first argument to define output type
-    return tile(dtype=a.dtype, shape=a.shape, layout=a.layout, strides=a.strides, storage="shared")
+    return tile(dtype=a.dtype, shape=a.shape, layout=a.layout, storage="shared")
 
 
 def tile_diag_add_lto_dispatch_func(
@@ -18997,7 +18997,7 @@ def _tile_cholesky_generic_value_func(inplace: bool, arg_types, arg_values):
 
     if inplace:
         return None
-    return tile(dtype=a.dtype, shape=a.shape, layout=a.layout, strides=a.strides, storage="shared")
+    return tile(dtype=a.dtype, shape=a.shape, layout=a.layout, storage="shared")
 
 
 def tile_cholesky_generic_value_func(arg_types, arg_values):
@@ -19020,6 +19020,29 @@ def _tile_cholesky_extract_fill_mode(arg_values, func_name="tile_cholesky"):
     else:
         fill_mode_str = "lower"
     return fill_mode_str == "upper"
+
+
+def _solver_operand_layout(t):
+    """Describe an actual solver operand's shared-memory arrangement and leading dimension."""
+    if len(t.shape) == 1:
+        # A vector is an M x 1 row-major RHS, including a strided column view.
+        if t.strides[0] > 0:
+            return "rowmajor", t.strides[0]
+    else:
+        rows, cols = t.shape
+        s0, s1 = t.strides
+        row_ld = s0 if s1 == 1 and s0 >= cols else None
+        col_ld = s1 if s0 == 1 and s1 >= rows else None
+        pairs = (("rowmajor", row_ld), ("colmajor", col_ld))
+        if t.layout == "colmajor":
+            pairs = pairs[::-1]
+        for arrangement, ld in pairs:
+            if ld is not None:
+                return arrangement, ld
+    raise ValueError(
+        f"cuSolverDx requires nonoverlapping rows or columns with unit inner stride; "
+        f"got shape={tuple(t.shape)} strides={tuple(t.strides)}"
+    )
 
 
 def _tile_cholesky_generic_lto_dispatch_func(
@@ -19077,6 +19100,8 @@ def _tile_cholesky_generic_lto_dispatch_func(
             if options["enable_backward"]:
                 req_smem_bytes += 2 * M * M * type_size_in_bytes(a.type.dtype)
 
+        factor_layout, factor_ld = _solver_operand_layout(a.type if inplace else out.type)
+
         # generate the forward LTO
         if M != N:
             raise RuntimeError(f"tile_cholesky() input must be square after validation, got shape ({M}, {N})")
@@ -19088,8 +19113,8 @@ def _tile_cholesky_generic_lto_dispatch_func(
             solver_enum,
             side_enum,
             diag_enum,
-            a.type.layout,
-            a.type.layout if inplace else out.type.layout,
+            factor_layout,
+            factor_layout,
             fill_mode,
             arch,
             precision_enum,
@@ -19097,6 +19122,7 @@ def _tile_cholesky_generic_lto_dispatch_func(
             parameter_list,
             builder,
             smem_estimate_bytes=req_smem_bytes,
+            lda=factor_ld,
         )
 
         if inplace:
@@ -19118,8 +19144,8 @@ def _tile_cholesky_generic_lto_dispatch_func(
 
             # LTO to calculate transpose(L).adj_L or adj_U.transpose(U)
             # Lower: first operand (L) flipped -> L^T; Upper: second operand (U) flipped -> U^T
-            gemm_layout_a = out.type.layout if upper else tile_flip_layout(out.type.layout)
-            gemm_layout_b = tile_flip_layout(out.type.layout) if upper else out.type.layout
+            gemm_layout_a = factor_layout if upper else tile_flip_layout(factor_layout)
+            gemm_layout_b = tile_flip_layout(factor_layout) if upper else factor_layout
             fun_bkwd_gemm, lto_bkwd_gemm = warp._src.build.build_lto_dot(
                 M,
                 M,
@@ -19129,10 +19155,13 @@ def _tile_cholesky_generic_lto_dispatch_func(
                 a.type.dtype,
                 gemm_layout_a,
                 gemm_layout_b,
-                out.type.layout,
+                "rowmajor",
                 arch,
                 num_threads,
                 builder,
+                lda=factor_ld,
+                ldb=factor_ld,
+                ldc=M,
             )
             # LTO to solve L^T @ X = Y (lower) or U @ X = Y (upper)
             fun_bkwd_trsm, lto_bkwd_trsm = warp._src.build.build_lto_solver(
@@ -19143,8 +19172,8 @@ def _tile_cholesky_generic_lto_dispatch_func(
                 cusolver_function_map["trsm"],
                 cusolver_side_map["left"],
                 cusolver_diag_map["nounit"],
-                tile_flip_layout(out.type.layout) if not upper else out.type.layout,
-                out.type.layout,
+                tile_flip_layout(factor_layout) if not upper else factor_layout,
+                "rowmajor",
                 cusolver_fill_mode_map["upper"],
                 arch,
                 precision_enum,
@@ -19152,6 +19181,8 @@ def _tile_cholesky_generic_lto_dispatch_func(
                 f"({dtype}*, {dtype}*)",
                 builder,
                 smem_estimate_bytes=req_smem_bytes,
+                lda=factor_ld,
+                ldb=M,
             )
             lto_list.extend([lto_bkwd_gemm, lto_bkwd_trsm])
         else:
@@ -19328,7 +19359,7 @@ def _tile_cholesky_solve_generic_value_func(inplace: bool, arg_types, arg_values
 
     if inplace:
         return None
-    return tile(dtype=l.dtype, shape=y.shape, layout=y.layout, strides=y.strides, storage="shared")
+    return tile(dtype=l.dtype, shape=y.shape, layout=y.layout, storage="shared")
 
 
 def tile_cholesky_solve_generic_value_func(arg_types, arg_values):
@@ -19405,6 +19436,9 @@ def _tile_cholesky_solve_generic_lto_dispatch_func(
         if not inplace:
             req_smem_bytes += x.type.size * type_size_in_bytes(L.type.dtype)
 
+        factor_layout, factor_ld = _solver_operand_layout(L.type)
+        rhs_layout, rhs_ld = _solver_operand_layout(y.type if inplace else x.type)
+
         # generate the LTO
         lto_symbol, lto_code_data = warp._src.build.build_lto_solver(
             M,
@@ -19414,8 +19448,8 @@ def _tile_cholesky_solve_generic_lto_dispatch_func(
             solver_enum,
             side_enum,
             diag_enum,
-            L.type.layout,
-            y.type.layout,
+            factor_layout,
+            rhs_layout,
             fill_mode,
             arch,
             precision_enum,
@@ -19423,6 +19457,8 @@ def _tile_cholesky_solve_generic_lto_dispatch_func(
             parameter_list,
             builder,
             smem_estimate_bytes=req_smem_bytes,
+            lda=factor_ld,
+            ldb=rhs_ld,
         )
 
         var = Var(lto_symbol, str, False, True, False)
@@ -19553,7 +19589,7 @@ def _tile_lower_solve_generic_value_func(inplace: bool, arg_types, arg_values):
 
     if inplace:
         return None
-    return tile(dtype=l.dtype, shape=y.shape, layout=y.layout, strides=y.strides, storage="shared")
+    return tile(dtype=l.dtype, shape=y.shape, layout=y.layout, storage="shared")
 
 
 def tile_lower_solve_generic_value_func(arg_types, arg_values):
@@ -19632,6 +19668,9 @@ def _tile_lower_solve_generic_lto_dispatch_func(
                 # to hold w in L^T w = adj_ret
                 req_smem_bytes += M * NRHS * type_size_in_bytes(L.type.dtype)
 
+        factor_layout, factor_ld = _solver_operand_layout(L.type)
+        rhs_layout, rhs_ld = _solver_operand_layout(y.type if inplace else z.type)
+
         # generate the forward LTO
         if M != N:
             raise RuntimeError(f"tile_lower_solve() input must be square after validation, got shape ({M}, {N})")
@@ -19643,8 +19682,8 @@ def _tile_lower_solve_generic_lto_dispatch_func(
             solver_enum,
             side_enum,
             diag_enum,
-            L.type.layout,
-            y.type.layout,
+            factor_layout,
+            rhs_layout,
             fill_mode,
             arch,
             precision_enum,
@@ -19652,6 +19691,8 @@ def _tile_lower_solve_generic_lto_dispatch_func(
             parameter_list,
             builder,
             smem_estimate_bytes=req_smem_bytes,
+            lda=factor_ld,
+            ldb=rhs_ld,
         )
 
         if inplace:
@@ -19681,7 +19722,7 @@ def _tile_lower_solve_generic_lto_dispatch_func(
                 solver_enum,
                 side_enum,
                 diag_enum,
-                tile_flip_layout(L.type.layout),
+                tile_flip_layout(factor_layout),
                 "rowmajor",
                 cusolver_fill_mode_map["upper"],
                 arch,
@@ -19690,6 +19731,8 @@ def _tile_lower_solve_generic_lto_dispatch_func(
                 parameter_list,
                 builder,
                 smem_estimate_bytes=req_smem_bytes,
+                lda=factor_ld,
+                ldb=NRHS,
             )
             lto_list.append(lto_bkwd_trsm)
         else:
@@ -19840,7 +19883,7 @@ def _tile_upper_solve_generic_value_func(inplace: bool, arg_types, arg_values):
 
     if inplace:
         return None
-    return tile(dtype=u.dtype, shape=z.shape, layout=z.layout, strides=z.strides, storage="shared")
+    return tile(dtype=u.dtype, shape=z.shape, layout=z.layout, storage="shared")
 
 
 def tile_upper_solve_generic_value_func(arg_types, arg_values):
@@ -19916,6 +19959,9 @@ def _tile_upper_solve_generic_lto_dispatch_func(
         if not inplace:
             req_smem_bytes += x.type.size * type_size_in_bytes(U.type.dtype)
 
+        factor_layout, factor_ld = _solver_operand_layout(U.type)
+        rhs_layout, rhs_ld = _solver_operand_layout(z.type if inplace else x.type)
+
         # generate the LTO
         if M != N:
             raise RuntimeError(f"tile_upper_solve() input must be square after validation, got shape ({M}, {N})")
@@ -19927,8 +19973,8 @@ def _tile_upper_solve_generic_lto_dispatch_func(
             solver_enum,
             side_enum,
             diag_enum,
-            U.type.layout,
-            z.type.layout,
+            factor_layout,
+            rhs_layout,
             fill_mode,
             arch,
             precision_enum,
@@ -19936,6 +19982,8 @@ def _tile_upper_solve_generic_lto_dispatch_func(
             parameter_list,
             builder,
             smem_estimate_bytes=req_smem_bytes,
+            lda=factor_ld,
+            ldb=rhs_ld,
         )
 
         var = Var(lto_symbol, str, False, True, False)
