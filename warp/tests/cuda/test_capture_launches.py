@@ -113,24 +113,33 @@ def test_reusable_snapshots(test, device):
 
 
 def test_struct_resource_lifetime(test, device):
-    with wp.ScopedDevice(device):
-        original = wp.zeros(2, dtype=int)
-        old_owner = weakref.ref(original)
-        nested = NestedMember()
-        nested.member.values = original
-        wp.load_module(device=device)
-        with wp.ScopedCapture(record_launches=True) as capture:
-            wp.launch(write_member, 2, [nested])
-        record = wp.capture_get_launches(capture.graph)[0]
-        packet = record.parameter_bytes
-        nested.member.values = wp.zeros_like(original)
-        del original
-        gc.collect()
-        test.assertIsNotNone(old_owner())
-        test.assertEqual(record.parameter_bytes, packet)
-        wp.capture_launch(capture.graph)
-        np.testing.assert_allclose(old_owner().numpy(), 11)
-        np.testing.assert_allclose(nested.member.values.numpy(), 0)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with wp.ScopedDevice(device):
+            original = wp.zeros(2, dtype=int)
+            old_owner = weakref.ref(original)
+            nested = NestedMember()
+            nested.member.values = original
+            wp.load_module(device=device)
+            with wp.ScopedCapture(record_launches=True) as capture:
+                wp.launch(write_member, 2, [nested])
+            record = wp.capture_get_launches(capture.graph)[0]
+            packet = record.parameter_bytes
+            nested.member.values = wp.zeros_like(original)
+            del original
+            test.assertIsNotNone(old_owner())
+            test.assertEqual(record.parameter_bytes, packet)
+            wp.capture_launch(capture.graph)
+            np.testing.assert_allclose(old_owner().numpy(), 11)
+            np.testing.assert_allclose(nested.member.values.numpy(), 0)
+            del record
+            test.assertIsNotNone(old_owner())
+            capture.graph = None
+            test.assertIsNone(old_owner())
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def test_tiled_compiled_bounds(test, device):
@@ -766,6 +775,37 @@ class TestCountParameters(unittest.TestCase):
 
 
 class TestCaptureLaunches(unittest.TestCase):
+    def test_argument_owner_release_without_cyclic_gc(self):
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            for kernel in (write_value, write_member, copy_tile):
+                with self.subTest(kernel=kernel.key):
+                    values = wp.zeros(2, dtype=float if kernel is copy_tile else int, device="cpu")
+                    owner = weakref.ref(values)
+                    if kernel is write_member:
+                        argument = NestedMember()
+                        argument.member.values = values
+                        arguments = [argument]
+                        del argument
+                    elif kernel is copy_tile:
+                        arguments = [values, values]
+                    else:
+                        arguments = [values, 3]
+                    params = [launch_bounds_t((2,))] + [
+                        context.pack_arg(kernel, arg.type, arg.label, value, wp.get_device("cpu"))
+                        for arg, value in zip(kernel.adj.args, arguments, strict=True)
+                    ]
+                    packets, owners = context._capture_launch_arguments(kernel, params, arguments, wp.get_device("cpu"))
+                    self.assertEqual(owners, (values, values) if kernel is copy_tile else (values,))
+                    del values, arguments, params
+                    self.assertIsNotNone(owner())
+                    del owners, packets
+                    self.assertIsNone(owner())
+        finally:
+            if was_enabled:
+                gc.enable()
+
     def test_launch_count_rejects_non_graph(self):
         with self.assertRaisesRegex(TypeError, "Warp Graph"):
             wp.capture_launch_count(object())

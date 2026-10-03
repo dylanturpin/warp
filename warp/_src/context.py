@@ -10776,19 +10776,6 @@ def _capture_launch_arguments(kernel, params, args, device):
         raise RuntimeError("Recorded launches require retained argument owners")
     owners = []
 
-    def retain(value):
-        if isinstance(value, warp._src.codegen.StructInstance):
-            for name in value._cls.vars:
-                retain(getattr(value, name))
-        elif isinstance(value, warp.array):
-            owners.append(value)
-        elif warp._src.types.is_array(value):
-            raise RuntimeError("Recorded launches currently require regular Warp arrays")
-        elif hasattr(value, "__cuda_array_interface__"):
-            raise RuntimeError("Recorded launches currently require regular Warp array owners")
-        elif isinstance(value, (Texture1D, Texture2D, Texture3D, ctypes.Structure)):
-            raise RuntimeError("Recorded launches do not support texture or raw ctypes resource arguments")
-
     for arg, value, param in zip(kernel.adj.args, args, params[1:], strict=True):
         if warp._src.types.is_array(arg.type) or isinstance(arg.type, warp._src.codegen.Struct):
             if value is not None and isinstance(value, ctypes.Structure):
@@ -10796,7 +10783,21 @@ def _capture_launch_arguments(kernel, params, args, device):
             packed = pack_arg(kernel, arg.type, arg.label, value, device)
             if bytes(packed) != bytes(param):
                 raise RuntimeError("Recorded launch argument descriptor changed since command preparation")
-        retain(value)
+        # Keep traversal local and acyclic: a recursive closure would retain
+        # this owner list independently of the graph until cyclic collection.
+        pending = [value]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, warp._src.codegen.StructInstance):
+                pending.extend(getattr(current, name) for name in reversed(current._cls.vars))
+            elif isinstance(current, warp.array):
+                owners.append(current)
+            elif warp._src.types.is_array(current):
+                raise RuntimeError("Recorded launches currently require regular Warp arrays")
+            elif hasattr(current, "__cuda_array_interface__"):
+                raise RuntimeError("Recorded launches currently require regular Warp array owners")
+            elif isinstance(current, (Texture1D, Texture2D, Texture3D, ctypes.Structure)):
+                raise RuntimeError("Recorded launches do not support texture or raw ctypes resource arguments")
     return tuple(bytes(param) for param in params), tuple(owners)
 
 
