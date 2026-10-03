@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import numpy as np
 
@@ -698,6 +700,72 @@ def test_stream_is_blocking(test, device):
     test.assertTrue(wrapped._is_blocking)  # now cached
 
 
+def test_stream_alias_registration(test, device):
+    """Releasing a borrowed alias must preserve a surviving stream's native state."""
+    stream = wp.Stream(device)
+    with wp.ScopedStream(stream):
+        aliases = [wp.Stream(device, cuda_stream=stream.cuda_stream) for _ in range(3)]
+        while aliases:
+            aliases.pop()
+            test.assertEqual(device.runtime.core.wp_cuda_context_get_stream(device.context), stream.cuda_stream)
+        # Stream-scope synchronization borrows the cached native event as well.
+        with wp.ScopedStream(wp.Stream(device)):
+            pass
+        test.assertEqual(device.runtime.core.wp_cuda_context_get_stream(device.context), stream.cuda_stream)
+
+
+def test_stream_alias_sort_capture(test, device):
+    """Alias retirement must preserve open capture metadata and sort replay."""
+    count = 256
+    stream = wp.Stream(device)
+    with wp.ScopedStream(stream):
+        source = wp.array(np.concatenate((np.arange(count - 1, -1, -1), np.zeros(count))), dtype=int, device=device)
+        keys, values = wp.zeros(2 * count, dtype=int, device=device), wp.zeros(2 * count, dtype=int, device=device)
+        wp.utils.radix_sort_pairs(keys, values, count)
+        alias = wp.Stream(device, cuda_stream=stream.cuda_stream)
+        with wp.ScopedCapture(stream=stream, force_module_load=False) as capture:
+            wp.copy(keys, source)
+            wp.copy(values, source)
+            wp.utils.radix_sort_pairs(keys, values, count)
+            del alias
+            test.assertEqual(device.runtime.core.wp_cuda_context_get_stream(device.context), stream.cuda_stream)
+            wp.utils.radix_sort_pairs(keys, values, count)
+        for _ in range(3):
+            alias = wp.Stream(device, cuda_stream=stream.cuda_stream)
+            del alias
+            wp.capture_launch(capture.graph, stream=stream)
+            assert_np_equal(keys.numpy()[:count], np.arange(count))
+            assert_np_equal(values.numpy()[:count], np.arange(count))
+
+
+def test_stream_alias_concurrent_registration(test, device):
+    """Concurrent borrowed wrappers share one registration lifetime."""
+    core = device.runtime.core
+    previous = core.wp_cuda_context_get_stream(device.context)
+    stream = wp.Stream(device)
+    handle = stream.cuda_stream
+    # Avoid retaining the tested owner in Device.stream: final release must clear
+    # native current-stream state, which also detects leaked registrations.
+    core.wp_cuda_context_set_stream(device.context, handle, 0)
+    barrier = Barrier(8)
+
+    def borrow(_):
+        core.wp_cuda_context_set_current(device.context)
+        barrier.wait()
+        for _ in range(2000):
+            alias = wp.Stream(device, cuda_stream=handle)
+            del alias
+
+    try:
+        with ThreadPoolExecutor(8) as pool:
+            list(pool.map(borrow, range(8)))
+        test.assertEqual(core.wp_cuda_context_get_stream(device.context), handle)
+        del stream
+        test.assertIsNone(core.wp_cuda_context_get_stream(device.context))
+    finally:
+        core.wp_cuda_context_set_stream(device.context, previous, 0)
+
+
 add_function_test(TestStreams, "test_stream_set", test_stream_set, devices=devices)
 add_function_test(TestStreams, "test_stream_arg_explicit_sync", test_stream_arg_explicit_sync, devices=devices)
 add_function_test(TestStreams, "test_stream_scope_implicit_sync", test_stream_scope_implicit_sync, devices=devices)
@@ -722,6 +790,11 @@ add_function_test(TestStreams, "test_graph_destroy_during_capture", test_graph_d
 add_function_test(TestStreams, "test_stream_synchronize_cpu", test_stream_synchronize_cpu, devices=None)
 add_function_test(TestStreams, "test_synchronize_during_capture", test_synchronize_during_capture, devices=devices)
 add_function_test(TestStreams, "test_stream_is_blocking", test_stream_is_blocking, devices=devices)
+add_function_test(TestStreams, "test_stream_alias_registration", test_stream_alias_registration, devices=devices)
+add_function_test(TestStreams, "test_stream_alias_sort_capture", test_stream_alias_sort_capture, devices=devices)
+add_function_test(
+    TestStreams, "test_stream_alias_concurrent_registration", test_stream_alias_concurrent_registration, devices=devices
+)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
