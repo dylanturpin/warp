@@ -3435,7 +3435,7 @@ class array(Array[DType, NDim]):
         elif dtype is builtins.bool:
             dtype = bool
 
-        if is_native_type(dtype) and (requires_grad or grad is not None or retain_grad):
+        if (requires_grad or grad is not None or retain_grad) and is_native_type(dtype):
             raise ValueError("Native value-type arrays do not support automatic differentiation")
 
         # convert shape to tuple (or leave shape=None if neither shape nor length were specified)
@@ -3445,7 +3445,7 @@ class array(Array[DType, NDim]):
             else:
                 # The type of shape's elements are eventually passed onto capacity which is used to allocate memory. We
                 # explicitly enforce that shape is a tuple of (64-bit) ints to ensure that capacity is 64-bit.
-                shape = tuple(int(x) for x in shape)
+                shape = tuple(map(int, shape))
                 if len(shape) > ARRAY_MAX_DIMS:
                     raise RuntimeError(
                         f"Failed to create array with shape {shape}, the maximum number of dimensions is {ARRAY_MAX_DIMS}"
@@ -4255,8 +4255,8 @@ class array(Array[DType, NDim]):
     # construct a C-representation of the array for passing to kernels
     def __ctype__(self):
         if self.ctype is None:
-            data = 0 if self.ptr is None else ctypes.c_uint64(self.ptr)
-            grad = 0 if self.grad is None or self.grad.ptr is None else ctypes.c_uint64(self.grad.ptr)
+            data = 0 if self.ptr is None else self.ptr
+            grad = 0 if self.grad is None or self.grad.ptr is None else self.grad.ptr
             flags = 0
             if self._retain_grad:
                 flags |= ARRAY_FLAG_RETAIN_GRAD
