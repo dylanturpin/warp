@@ -386,7 +386,7 @@ adj_tile_cholesky_impl(BkwdGemm fun_bkwd_gemm, BkwdTrsm fun_bkwd_trsm, TileOut& 
 
         // Accumulate B into adj_A.grad (upper or lower triangle only).
         // Diagonal halved because B = A_bar + A_bar^T double-counts it.
-        // W1 and adj_A share same layout so gradient accumulates at correct indices.
+        // W1 is dense row-major; adj_A is addressed through its own layout.
         for (int idx = WP_TILE_THREAD_IDX; idx < n * n; idx += WP_TILE_BLOCK_DIM) {
             int row = idx / n;
             int col = idx % n;
