@@ -55,8 +55,8 @@ static TempMapPerCapture g_temp_cache_per_capture;
 // Side streams for unsafe operations during capture (e.g., side allocs).
 static std::unordered_map<CUcontext, CUstream> g_side_streams;
 
-// Protect g_temp_cache, g_temp_cache_per_capture, and g_side_streams.
-static std::mutex g_cache_mutex;
+// The shared stream metadata lock protects these caches and registration as one
+// lifetime boundary, including side-stream creation and last-reference cleanup.
 
 template <int Size> struct SortPayload {
     uint8_t data[Size];
@@ -87,7 +87,7 @@ static void cached_side_alloc(
     size_t size, bool async, CUstream stream, uint64_t capture_id, CaptureInfo* capture, TempBuffer& temp_ret
 )
 {
-    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_cuda_stream_mutex);
 
     // Use a capture-specific temp cache.
     // If this is a child graph capture, we should use the parent's capture->id.
@@ -177,7 +177,7 @@ static bool acquire_temp_buffer(size_t size, TempBuffer& temp_ret)
         }
     } else {
         // No capture, use global temp cache.
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        std::lock_guard<std::recursive_mutex> lock(g_cuda_stream_mutex);
         TempBuffer& temp = g_temp_cache[get_stream_id(stream)];
         if (size > temp.size) {
             if (temp.mem) {
@@ -226,7 +226,7 @@ size_t radix_sort_temp_size(void* context, int n, int begin_bit, int end_bit)
 
 void radix_sort_stream_release(void* context, void* stream)
 {
-    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_cuda_stream_mutex);
 
     // Release temporary buffers created for the given stream. Lookup is by the
     // stored stream handle rather than the stream id, since the id cannot be
@@ -254,7 +254,7 @@ void radix_sort_context_release(void* context)
 
     CUstream side_stream = NULL;
     {
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        std::lock_guard<std::recursive_mutex> lock(g_cuda_stream_mutex);
         auto it = g_side_streams.find(static_cast<CUcontext>(context));
         if (it != g_side_streams.end()) {
             side_stream = it->second;
@@ -269,7 +269,7 @@ void radix_sort_context_release(void* context)
 
 void radix_sort_end_capture(uint64_t capture_id)
 {
-    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_cuda_stream_mutex);
     g_temp_cache_per_capture.erase(capture_id);
 }
 

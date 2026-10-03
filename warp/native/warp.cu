@@ -203,6 +203,7 @@ static std::map<CUdevice, DeviceInfo*> g_device_map;
 static std::map<CUcontext, ContextInfo> g_contexts;
 
 // cached info for all known streams (including registered external streams)
+std::recursive_mutex g_cuda_stream_mutex;
 static std::unordered_map<CUstream, StreamInfo> g_streams;
 
 // Ongoing graph captures registered using wp.capture_begin().
@@ -385,6 +386,7 @@ static inline ContextInfo* get_context_info(void* context) { return get_context_
 
 StreamInfo* get_stream_info(CUstream stream)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_cuda_stream_mutex);
     auto it = g_streams.find(stream);
     if (it != g_streams.end())
         return &it->second;
@@ -964,6 +966,7 @@ void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
                 //   - The free node already depends on these nodes
                 //     (get_dependent_leaf_nodes() + cudaGraphAddMemFreeNode() above).
                 //   - We replace all alloc-dependent deps with the new free node. Other deps remain unchanged.
+                std::lock_guard<std::recursive_mutex> lock(g_cuda_stream_mutex);
                 for (const auto& kv : g_streams) {
                     cudaStream_t other_stream = kv.first;
                     CUstreamCaptureStatus other_capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
@@ -3267,8 +3270,10 @@ void wp_cuda_stream_register(void* context, void* stream)
     ContextGuard guard(context);
 
     // populate stream info
+    std::lock_guard<std::recursive_mutex> lock(g_cuda_stream_mutex);
     StreamInfo& stream_info = g_streams[static_cast<CUstream>(stream)];
-    check_cu(cuEventCreate_f(&stream_info.cached_event, CU_EVENT_DISABLE_TIMING));
+    if (stream_info.registration_count++ == 0)
+        check_cu(cuEventCreate_f(&stream_info.cached_event, CU_EVENT_DISABLE_TIMING));
 }
 
 void wp_cuda_stream_unregister(void* context, void* stream)
@@ -3278,8 +3283,13 @@ void wp_cuda_stream_unregister(void* context, void* stream)
 
     CUstream cuda_stream = static_cast<CUstream>(stream);
 
+    // Keep final cleanup atomic with re-registration of an external live handle.
+    // The sort cache uses this same lock, including re-entrant side-stream work.
+    std::lock_guard<std::recursive_mutex> lock(g_cuda_stream_mutex);
     StreamInfo* stream_info = get_stream_info(cuda_stream);
     if (stream_info) {
+        if (--stream_info->registration_count != 0)
+            return;
         // release stream info
         check_cu(cuEventDestroy_f(stream_info->cached_event));
         g_streams.erase(cuda_stream);

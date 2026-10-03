@@ -1,0 +1,1 @@
+Preserve native stream state, capture bookkeeping, and cached resources until the last Warp wrapper releases a CUDA stream. Destroying a temporary wrapper around a still-used stream no longer changes the native current stream or invalidates its shared registration.

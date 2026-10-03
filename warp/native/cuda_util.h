@@ -7,6 +7,7 @@
 
 #if WP_ENABLE_CUDA
 
+#include <mutex>
 #include <vector>
 
 #include <cudaTypedefs.h>
@@ -396,11 +397,18 @@ struct CaptureInfo {
 };
 
 struct StreamInfo {
+    size_t registration_count = 0;  // Python wrappers can independently borrow the same external stream
     CUevent cached_event = NULL;  // event used for stream synchronization (cached to avoid creating temporary events)
     CaptureInfo* capture = NULL;  // capture info (only if started on this stream)
 };
 
+// Stream registration and its sort-cache metadata share one lock. Recursion is
+// required when cached sort allocation creates a side stream, or cleanup frees
+// graph memory and visits the registry. It does not serialize GPU execution.
+extern std::recursive_mutex g_cuda_stream_mutex;
+
 CaptureInfo* get_capture_info(CUstream stream);
+// The caller must retain a stream registration while using the borrowed pointer.
 StreamInfo* get_stream_info(CUstream stream);
 
 // Find the registered capture that owns the given capture id, either directly
