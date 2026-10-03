@@ -10712,7 +10712,7 @@ def invoke(kernel, hooks, params: Sequence[Any], adjoint: bool):
 
 
 def _build_cuda_kernel_params(params: Sequence[Any]):
-    kernel_args = [ctypes.c_void_p(ctypes.addressof(x)) for x in params]
+    kernel_args = [ctypes.addressof(x) for x in params]
     return (ctypes.c_void_p * len(kernel_args))(*kernel_args)
 
 
@@ -11720,7 +11720,7 @@ def launch(
                 invoke(kernel, hooks, params, adjoint)
 
         else:
-            kernel_args = [ctypes.c_void_p(ctypes.addressof(x)) for x in params]
+            kernel_args = [ctypes.addressof(x) for x in params]
             kernel_params = (ctypes.c_void_p * len(kernel_args))(*kernel_args)
 
             # cluster_dim is resolved and cached on the hooks at load time; the
