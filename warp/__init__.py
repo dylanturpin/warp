@@ -104,6 +104,8 @@ _register_module_source("warp.fem.utils", "warp._src.fem.utils")
 from warp._src.types import Int as Int
 from warp._src.types import Float as Float
 from warp._src.types import Scalar as Scalar
+from warp._src.types import CountParameter as CountParameter
+from warp._src.types import upper_bound as upper_bound
 from warp._src.context import DeviceLike as DeviceLike
 from warp._src.types import ref as ref
 

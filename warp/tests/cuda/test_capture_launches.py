@@ -6,6 +6,7 @@
 import ctypes
 import dataclasses
 import gc
+import operator
 import unittest
 import weakref
 from unittest import mock
@@ -611,6 +612,159 @@ def test_captured_memory_rejects_stale_array_abi(test, device):
                     setattr(array, name, previous)
 
 
+def test_count_parameter_occurrences_and_obligations(test, device):
+    with wp.ScopedDevice(device):
+        first, second = wp.CountParameter(8), wp.CountParameter(8)
+        values = wp.zeros(8, dtype=int)
+        condition = wp.ones(1, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.launch(write_value, first, [values, second])
+            wp.capture_if(condition, lambda: wp.launch(write_value, second, [values, first]))
+        records = wp.capture_get_launches(capture.graph)
+        test.assertEqual(len(records), 2)
+        for record, extent, scalar in ((records[0], first, second), (records[1], second, first)):
+            test.assertEqual(record.extent_parameters[0][0], 0)
+            test.assertIs(record.extent_parameters[0][1], extent)
+            test.assertEqual(record.scalar_parameters[0][0], 2)
+            test.assertIs(record.scalar_parameters[0][1], scalar)
+            test.assertEqual(ctypes.c_int32.from_buffer_copy(record.parameter_bytes[2]).value, 8)
+        test.assertEqual(len(capture.graph._preparation_owners), 2)
+        with test.assertRaisesRegex(RuntimeError, "preparation"):
+            wp.capture_launch(capture.graph)
+        wp.capture_complete_preparation(capture.graph, first)
+        with test.assertRaisesRegex(RuntimeError, "preparation"):
+            wp.capture_launch(capture.graph)
+        # This test's consumer binds both operands to their captured maxima.
+        wp.capture_complete_preparation(capture.graph, second)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(values.numpy(), 8)
+
+
+def test_count_parameter_tiled_and_prefix_memory(test, device):
+    with wp.ScopedDevice(device):
+        rows, value = wp.CountParameter(3), wp.CountParameter(7)
+        source = wp.array(np.arange(20, dtype=np.float32))
+        target = wp.full(20, -1.0, dtype=float)
+        array = wp.full((8, 2), -1, dtype=int)
+        copied = wp.full((10, 2), -2, dtype=int)
+        optional = wp.empty((8, 0), dtype=float)
+        wp.launch_tiled(copy_tile, dim=1, inputs=[source, target], block_dim=32)
+        with wp.ScopedCapture(record_launches=True, record_memory_operations=True) as capture:
+            wp.launch_tiled(copy_tile, dim=rows, inputs=[source, target], block_dim=32)
+            array.fill_(value, extent=(rows, 2))
+            wp.copy(copied, array, extent=(rows, 2))
+            optional.zero_(extent=(wp.CountParameter(8), 0))
+        records = wp.capture_get_launches(capture.graph)
+        operations = wp.capture_get_memory_operations(capture.graph)
+        test.assertEqual(len(records), 3)
+        test.assertEqual(len(operations), 2)
+        test.assertIs(records[0].extent_parameters[0][1], rows)
+        bounds = type(launch_bounds_t((0,))).from_buffer_copy(records[0].parameter_bytes[0])
+        test.assertEqual(bounds.coord_mult, 32)
+        for operation in operations:
+            test.assertIs(operation.extent[0], rows)
+        test.assertIs(operations[0].value_parameter, value)
+        test.assertIs(records[1].scalar_parameters[0][1], value)
+        test.assertEqual(len(capture.graph._preparation_owners), 2)
+        wp.capture_complete_preparation(capture.graph, rows)
+        wp.capture_complete_preparation(capture.graph, value)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(array.numpy()[:3], 7)
+        np.testing.assert_array_equal(array.numpy()[3:], -1)
+        np.testing.assert_array_equal(copied.numpy()[:3], 7)
+        np.testing.assert_array_equal(copied.numpy()[3:], -2)
+        np.testing.assert_array_equal(target.numpy()[:12], source.numpy()[:12])
+
+
+def test_count_parameter_rejects_unrecorded_and_wrong_scalar(test, device):
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(4)
+        values = wp.zeros(8, dtype=int)
+        unaligned = wp.array(ptr=values.ptr + 1, shape=(4,), dtype=int, device=device)
+        wp.load_module(device=device)
+        for operation in (
+            lambda: wp.launch(write_value, count, [values, 3]),
+            lambda: values.fill_(count),
+            lambda: values.zero_(extent=(count,)),
+        ):
+            with test.assertRaisesRegex(RuntimeError, "recorded"):
+                operation()
+        for operation in (
+            lambda: wp.launch(write_value, count, [values, 3], record_cmd=True),
+            lambda: wp.launch(write_value, (8, count), [values, 3]),
+            lambda: values.zero_(extent=(wp.CountParameter(9),)),
+            lambda: unaligned.fill_(count),
+        ):
+            with wp.ScopedCapture(record_launches=True, record_memory_operations=True) as capture:
+                with test.assertRaises((RuntimeError, ValueError, NotImplementedError)):
+                    operation()
+            with test.assertRaises(RuntimeError):
+                wp.capture_launch(capture.graph)
+
+
+class TestCountParameters(unittest.TestCase):
+    def test_identity_and_host_protocol(self):
+        value, other = wp.CountParameter(8), wp.CountParameter(8)
+        self.assertIsNot(value, other)
+        self.assertEqual(tuple(field.name for field in dataclasses.fields(value)), ("maximum",))
+        self.assertEqual(wp.upper_bound(value), 8)
+        self.assertEqual(wp.upper_bound(0), 0)
+        self.assertEqual(wp.upper_bound(wp.CountParameter(2**40)), 2**40)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            value.maximum = 1
+        for operation in (bool, int, float, complex, operator.index, abs, round, operator.neg):
+            with self.subTest(operation=operation), self.assertRaises(TypeError):
+                operation(value)
+        for operation in (
+            operator.eq,
+            operator.ne,
+            operator.lt,
+            operator.add,
+            operator.mul,
+            operator.floordiv,
+            operator.and_,
+        ):
+            with self.subTest(operation=operation), self.assertRaises(TypeError):
+                operation(value, 1)
+            with self.subTest(reverse=operation), self.assertRaises(TypeError):
+                operation(1, value)
+        for invalid in (-1, True, 1.0, np.int32(1)):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                wp.CountParameter(invalid)
+        with self.assertRaises(TypeError):
+            wp.empty((value,), dtype=float, device="cpu")
+
+    def test_eager_prefix_preserves_full_array_semantics(self):
+        with wp.ScopedDevice("cpu"):
+            source = wp.array(np.arange(24, dtype=np.int32).reshape(8, 3), dtype=int)
+            target = wp.full((10, 3), -1, dtype=int)
+            wp.copy(target, source, extent=(2, 3))
+            target.fill_(7, extent=(1, 3))
+            target.zero_(extent=(0, 3))
+            np.testing.assert_array_equal(target.numpy()[0], 7)
+            np.testing.assert_array_equal(target.numpy()[1], source.numpy()[1])
+            np.testing.assert_array_equal(target.numpy()[2:], -1)
+            target.fill_(4)
+            np.testing.assert_array_equal(target.numpy(), 4)
+            for extent in ((11, 3), (2, 2), (2,), (True, 3)):
+                with self.subTest(extent=extent), self.assertRaises(ValueError):
+                    target.fill_(0, extent=extent)
+            with self.assertRaises(ValueError):
+                wp.copy(target, source, count=1, extent=(2, 3))
+            with self.assertRaisesRegex(RuntimeError, "recorded"):
+                target.fill_(1, extent=(wp.CountParameter(8), 3))
+            for shape in ((0,), (4, 0), (0, 3), (2, 0, 3)):
+                with self.subTest(empty_shape=shape):
+                    empty = wp.empty(shape, dtype=int)
+                    empty.fill_(7, extent=shape)
+                    empty.zero_(extent=shape)
+                    wp.copy(empty, empty, extent=shape)
+                    self.assertEqual(empty.size, 0)
+            wp.copy(target, source, extent=(0, 3))
+            np.testing.assert_array_equal(target.numpy(), 4)
+
+
 class TestCaptureLaunches(unittest.TestCase):
     def test_launch_count_rejects_non_graph(self):
         with self.assertRaisesRegex(TypeError, "Warp Graph"):
@@ -651,6 +805,9 @@ for test_func in (
     test_captured_memory_rejects_unsupported,
     test_captured_memory_streams_and_conditions,
     test_captured_memory_rejects_stale_array_abi,
+    test_count_parameter_occurrences_and_obligations,
+    test_count_parameter_tiled_and_prefix_memory,
+    test_count_parameter_rejects_unrecorded_and_wrong_scalar,
 ):
     add_function_test(TestCaptureLaunches, test_func.__name__, test_func, devices=get_selected_cuda_test_devices())
 

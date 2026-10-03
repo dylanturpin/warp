@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Explicit capture lowering for whole-array memory operations.
+"""Explicit capture lowering for whole-array and declared-prefix memory operations.
 
 Kernels preserve byte representation and expose the leading row axis in their
 launch bounds. They know no storage owner, readable prefix, or execution count.
@@ -40,6 +40,12 @@ def _fill_constant_byte(destination: wp.array2d[wp.uint8], value: wp.uint8):
 
 @wp.kernel
 def _fill_constant_word(destination: wp.array2d[wp.uint32], value: wp.uint32):
+    row, column = wp.tid()
+    destination[row, column] = value
+
+
+@wp.kernel
+def _fill_count(destination: wp.array2d[wp.int32], value: int):
     row, column = wp.tid()
     destination[row, column] = value
 
@@ -101,9 +107,21 @@ def _word_aligned(array, width):
     return array.ptr % 4 == 0 and array.strides[0] % 4 == 0 and width % 4 == 0
 
 
-def _overlapping_rows(destination, source, width):
+def _prefix_extent(array, extent):
+    """Validate a leading logical prefix independently of physical accessibility."""
+    if extent is None:
+        return array.shape
+    if not isinstance(extent, tuple) or len(extent) != array.ndim:
+        raise ValueError("Memory extent must be a tuple matching the array rank")
+    if any(type(size) is not int or size != bound for size, bound in zip(extent[1:], array.shape[1:], strict=True)):
+        raise ValueError("Memory extent requires fixed inner dimensions matching the array")
+    if types.upper_bound(extent[0]) > array.shape[0]:
+        raise ValueError("Memory extent exceeds the array's reserved leading dimension")
+    return extent
+
+
+def _overlapping_rows(destination, source, width, count):
     left, right = sorted((destination, source), key=lambda array: array.ptr)
-    count = left.shape[0]
     if left.ptr + (count - 1) * left.strides[0] + width <= right.ptr:
         return False
     if left.strides[0] != right.strides[0]:
@@ -112,23 +130,32 @@ def _overlapping_rows(destination, source, width):
     return (remainder < width and quotient < count) or (remainder + width > left.strides[0] and quotient + 1 < count)
 
 
-def fill(graph, array, value_bytes):
+def fill(graph, array, value_bytes, *, extent=None, value_parameter=None):
     """Lower one converted fill value; preserve its complete typed byte pattern."""
     try:
         context._validate_capture(graph)
+        extent = _prefix_extent(array, extent)
         width = _row_bytes(array, graph)
         element_bytes = types.type_size_in_bytes(array.dtype)
         if len(value_bytes) != element_bytes or element_bytes > 128:
             raise NotImplementedError("Memory operation capture supports fill elements of at most 128 bytes")
-        if not array.size:
+        if value_parameter is not None and (
+            array.dtype is not wp.int32 or not isinstance(value_parameter, types.CountParameter)
+        ):
+            raise TypeError("A count fill value requires an int32 array and CountParameter")
+        if not array.size or types.upper_bound(extent[0]) == 0:
             return
         descriptor = bytes(array.__ctype__())
         words = _word_aligned(array, width)
+        if value_parameter is not None and not words:
+            raise NotImplementedError("Count fill values require an int32-aligned base and outer stride")
         # Whole-word transfers preserve even subword/odd-sized element periods.
         pattern_bytes = value_bytes * (4 // math.gcd(element_bytes, 4)) if words else value_bytes
         if len(pattern_bytes) > 128:
             words, pattern_bytes = False, value_bytes
-        if words:
+        if value_parameter is not None:
+            kernel, arguments, dtype = _fill_count, [value_parameter], wp.int32
+        elif words:
             values = [int.from_bytes(pattern_bytes[i : i + 4], "little") for i in range(0, len(pattern_bytes), 4)]
             if len(set(values)) == 1:
                 kernel, arguments = _fill_constant_word, [wp.uint32(values[0])]
@@ -144,47 +171,58 @@ def fill(graph, array, value_bytes):
             dtype = wp.uint8
         transfer = _transfer_view(array, width, dtype)
         before = len(graph._captured_launches)
-        wp.launch(kernel, dim=transfer.shape, inputs=[transfer, *arguments], device=array.device)
+        wp.launch(kernel, dim=(extent[0], transfer.shape[1]), inputs=[transfer, *arguments], device=array.device)
         if len(graph._captured_launches) != before + 1:
             raise RuntimeError("Memory operation did not produce one canonical captured launch")
         graph._captured_memory_operations.append(
-            context.CapturedFill(graph._captured_launches[-1], array.dtype, descriptor, value_bytes)
+            context.CapturedFill(
+                graph._captured_launches[-1], array.dtype, descriptor, value_bytes, extent, value_parameter
+            )
         )
     except BaseException as error:
         context.capture_invalidate(graph, f"Failed memory operation capture: {error}")
         raise
 
 
-def copy(graph, destination, source, destination_offset, source_offset, count, stream):
-    """Lower an exact full-array copy; reject partial or overlapping payloads."""
+def copy(graph, destination, source, destination_offset, source_offset, count, stream, *, extent=None):
+    """Lower a full copy or declared logical prefix; preserve byte representation."""
     try:
         context._validate_capture(graph)
+        explicit_extent = extent is not None
+        extent = _prefix_extent(destination, extent)
+        _prefix_extent(source, extent)
         width = _row_bytes(destination, graph)
         source_width = _row_bytes(source, graph)
         destination_offset, source_offset, count = map(operator.index, (destination_offset, source_offset, count))
-        if destination_offset or source_offset or count not in (0, source.size):
+        if destination_offset or source_offset or count not in ((0,) if explicit_extent else (0, source.size)):
             raise NotImplementedError("Memory operation capture supports only full-array copies without offsets")
-        if destination.shape != source.shape or width != source_width:
+        if (not explicit_extent and destination.shape != source.shape) or width != source_width:
             raise NotImplementedError("Memory operation capture requires equal shapes and element byte sizes")
         if stream is not None and stream.device != graph.device:
             raise NotImplementedError("Memory operation capture requires a stream on the captured CUDA device")
-        if not destination.size:
+        rows = types.upper_bound(extent[0])
+        if not destination.size or not rows:
             return
         destination_descriptor, source_descriptor = bytes(destination.__ctype__()), bytes(source.__ctype__())
-        if destination_descriptor == source_descriptor:
+        if destination.ptr == source.ptr and destination.strides == source.strides:
             return
-        if _overlapping_rows(destination, source, width):
+        if _overlapping_rows(destination, source, width, rows):
             raise ValueError("Memory operation capture rejects overlapping copy payloads")
         words = _word_aligned(destination, width) and _word_aligned(source, width)
         kernel, dtype = (_copy_words, wp.uint32) if words else (_copy_bytes, wp.uint8)
         dst, src = _transfer_view(destination, width, dtype), _transfer_view(source, width, dtype)
         before = len(graph._captured_launches)
-        wp.launch(kernel, dim=dst.shape, inputs=[dst, src], stream=stream, device=destination.device)
+        wp.launch(kernel, dim=(extent[0], dst.shape[1]), inputs=[dst, src], stream=stream, device=destination.device)
         if len(graph._captured_launches) != before + 1:
             raise RuntimeError("Memory operation did not produce one canonical captured launch")
         graph._captured_memory_operations.append(
             context.CapturedCopy(
-                graph._captured_launches[-1], destination.dtype, destination_descriptor, source.dtype, source_descriptor
+                graph._captured_launches[-1],
+                destination.dtype,
+                destination_descriptor,
+                source.dtype,
+                source_descriptor,
+                extent,
             )
         )
     except BaseException as error:

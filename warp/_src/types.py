@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import builtins
 import ctypes
+import dataclasses
 import enum
 import functools
 import inspect
@@ -42,6 +43,50 @@ Cols = TypeVar("Cols", bound=int)
 Capacity = TypeVar("Capacity", bound=int)
 DType = TypeVar("DType")
 Shape = TypeVar("Shape", bound=tuple[int, ...])
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class CountParameter:
+    """An identity-bearing nonnegative count operand with an inclusive upper bound.
+
+    Recorded CUDA operations preserve this operand until an external consumer
+    binds its value. It owns no device allocation. Host arithmetic, comparison,
+    truth testing and numeric conversion are deliberately unsupported; use
+    :func:`warp.upper_bound` for an explicit static planning decision.
+
+    Args:
+        maximum: Inclusive nonnegative Python integer bound. Individual operation
+            backends may impose narrower representable ranges.
+    """
+
+    maximum: int
+
+    def __post_init__(self):
+        if type(self.maximum) is not int or self.maximum < 0:
+            raise ValueError("CountParameter maximum must be a nonnegative Python integer")
+
+    def _unsupported(self, *args):
+        raise TypeError("CountParameter has no host numeric value; use upper_bound for static planning")
+
+    __bool__ = __int__ = __index__ = __float__ = __complex__ = _unsupported
+    __eq__ = __ne__ = __lt__ = __le__ = __gt__ = __ge__ = _unsupported
+    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _unsupported
+    __truediv__ = __rtruediv__ = __floordiv__ = __rfloordiv__ = _unsupported
+    __mod__ = __rmod__ = __pow__ = __rpow__ = __divmod__ = __rdivmod__ = _unsupported
+    __and__ = __rand__ = __or__ = __ror__ = __xor__ = __rxor__ = _unsupported
+    __lshift__ = __rlshift__ = __rshift__ = __rrshift__ = _unsupported
+    __neg__ = __pos__ = __abs__ = __invert__ = __round__ = _unsupported
+    __hash__ = object.__hash__
+
+
+def upper_bound(count: int | CountParameter) -> int:
+    """Return a count's explicit static bound without reading a device value."""
+    if isinstance(count, CountParameter):
+        return count.maximum
+    if type(count) is not int or count < 0:
+        raise ValueError("A count must be a nonnegative Python integer or CountParameter")
+    return count
+
 
 # NDim has a default under TYPE_CHECKING so that static type checkers (mypy, pyright)
 # accept both array[dtype] and array[dtype, Literal[ndim]] subscript syntax (PEP 696).
@@ -4356,10 +4401,10 @@ class array(Array[DType, NDim]):
         if apic_capture is not None:
             apic_capture.track_array(self)
 
-    def zero_(self):
-        """Zero out the array entries."""
-        if warp._src.context._capture_memory_graph(self.device) is not None:
-            self.fill_(0)
+    def zero_(self, *, extent=None):
+        """Zero array entries, or an explicit leading prefix as in :meth:`fill_`."""
+        if extent is not None or warp._src.context._capture_memory_graph(self.device) is not None:
+            self.fill_(0, extent=extent)
             return
         self._apic_ensure_tracked()
         if self.is_contiguous:
@@ -4369,11 +4414,18 @@ class array(Array[DType, NDim]):
             self.fill_(0)
         self.mark_init()
 
-    def fill_(self, value):
+    def fill_(self, value, *, extent=None):
         """Set all array entries to `value`
 
-        args:
+        Args:
             value: The value to set every array entry to. Must be convertible to the array's ``dtype``.
+                A :class:`CountParameter` is supported for int32 arrays during
+                recorded CUDA memory operations.
+            extent: Optional leading logical prefix ``(rows, *self.shape[1:])``.
+                Inner dimensions stay fixed. ``rows`` may be a CountParameter
+                during a capture with launch and memory-operation recording enabled.
+                Its upper bound must fit the concrete array shape. Omission fills
+                the complete array; readiness never implicitly narrows this extent.
 
         Raises:
             ValueError: If `value` cannot be converted to the array's ``dtype``.
@@ -4396,6 +4448,33 @@ class array(Array[DType, NDim]):
                    [[1., 2.],
                     [3., 4.]]], dtype=float32)
         """
+        memory_graph = warp._src.context._capture_memory_graph(self.device)
+        value_parameter = value if isinstance(value, CountParameter) else None
+        if extent is not None or value_parameter is not None:
+            from warp._src import capture_memory  # noqa: PLC0415
+
+            try:
+                declared = capture_memory._prefix_extent(self, extent)
+                dynamic = isinstance(declared[0], CountParameter) or value_parameter is not None
+                if dynamic and memory_graph is None:
+                    raise RuntimeError("Count memory operands require recorded CUDA memory operations")
+                if value_parameter is not None:
+                    if self.dtype is not int32 or value_parameter.maximum >= 2**31:
+                        raise TypeError("A count fill value requires an int32 array and int32 upper bound")
+                    value = value_parameter.maximum
+                if self.size == 0 or upper_bound(declared[0]) == 0:
+                    return
+                if memory_graph is None:
+                    self[: declared[0]].fill_(value)
+                    return
+                extent = declared
+            except BaseException as error:
+                graph = memory_graph
+                if graph is None and self.device.is_cuda:
+                    graph = warp._src.context._capture_for_stream(self.device.stream)
+                if graph is not None:
+                    warp._src.context.capture_invalidate(graph, f"Failed memory extent or value: {error}")
+                raise
         if self.size == 0:
             return
 
@@ -4448,8 +4527,16 @@ class array(Array[DType, NDim]):
         if memory_graph is not None:
             from warp._src import capture_memory  # noqa: PLC0415
 
-            capture_memory.fill(memory_graph, self, ctypes.string_at(cvalue_ptr, cvalue_size))
-            self.mark_init()
+            capture_memory.fill(
+                memory_graph,
+                self,
+                ctypes.string_at(cvalue_ptr, cvalue_size),
+                extent=extent,
+                value_parameter=value_parameter,
+            )
+            # A prefix does not establish initialization of the entire array.
+            if extent is None:
+                self.mark_init()
             return
 
         # prefer using memtile for contiguous arrays, because it should be faster than generic fill

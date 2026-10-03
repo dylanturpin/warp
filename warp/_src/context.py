@@ -73,7 +73,7 @@ import warp.config
 from warp._src.codegen import WarpCodegenError, WarpCodegenTypeError, _codegen_lock, synchronized
 from warp._src.logger import LOG_DEBUG, LOG_WARNING, get_logger, log_debug, log_error, log_info, log_warning
 from warp._src.texture import Texture1D, Texture2D, Texture3D, texture1d_t, texture2d_t, texture3d_t
-from warp._src.types import LAUNCH_MAX_DIMS, Array, LaunchBounds, array_t, launch_bounds_t, type_repr
+from warp._src.types import LAUNCH_MAX_DIMS, Array, CountParameter, LaunchBounds, array_t, launch_bounds_t, type_repr
 
 _KERNEL_RETURN_ERROR = (
     "Warp kernels cannot return values. Write results to output arguments, "
@@ -5998,7 +5998,8 @@ class CapturedLaunch:
     in kernel argument order. ``argument_owners`` retain resources independently
     of these snapshots and must not be interpreted as captured descriptors.
     Handles identify the exact node and its immediate graph, including bodies
-    of conditional nodes. This record declares no execution-count semantics.
+    of conditional nodes. Parameter occurrences preserve operand identity before
+    lowering to upper bounds; no device source or application meaning is inferred.
     """
 
     kernel: Kernel
@@ -6010,33 +6011,40 @@ class CapturedLaunch:
     block_dim: int
     max_blocks: int
     grid_stride: bool
+    extent_parameters: tuple[tuple[int, CountParameter], ...] = ()
+    scalar_parameters: tuple[tuple[int, CountParameter], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class CapturedFill:
-    """A captured whole-array fill and its immutable original operand facts.
+    """A captured fill and its immutable original operands and logical extent.
 
     ``array_descriptor`` contains the original array's packed Warp descriptor;
     ``value_bytes`` is one complete typed element. The canonical launch owns
     borrowed transfer views, which retain the original array. Its leading launch
-    axis is the original array's leading row axis. This record grants no backing
-    accessibility or execution-count semantics.
+    axis is the original array's leading row axis. ``value_parameter`` identifies
+    a dynamic int32 value; its upper bound is encoded in ``value_bytes``. Omitted
+    extent arguments become the full concrete array shape. This record grants no
+    backing accessibility or initialization guarantee.
     """
 
     launch: CapturedLaunch
     array_dtype: type
     array_descriptor: bytes
     value_bytes: bytes
+    extent: tuple[int | CountParameter, ...] = ()
+    value_parameter: CountParameter | None = None
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class CapturedCopy:
-    """A captured whole-array copy with immutable original operand descriptors.
+    """A captured copy with immutable operand descriptors and logical extent.
 
     The canonical launch retains both original arrays through its borrowed
     transfer views. Descriptor bytes, rather than mutable owner attributes,
     describe the operands that were recorded. Its leading launch axis is the
-    shared leading row axis of both arrays.
+    shared leading row axis of both arrays. ``extent`` is the declared logical
+    prefix; omitted extent arguments become the full concrete array shape.
     """
 
     launch: CapturedLaunch
@@ -6044,6 +6052,7 @@ class CapturedCopy:
     destination_descriptor: bytes
     source_dtype: type
     source_descriptor: bytes
+    extent: tuple[int | CountParameter, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -10789,7 +10798,19 @@ def _capture_launch_arguments(kernel, params, args, device):
     return tuple(bytes(param) for param in params), tuple(owners)
 
 
-def _record_captured_launch(graph, kernel, bounds, packets, owners, stream, block_dim, max_blocks, grid_stride):
+def _record_captured_launch(
+    graph,
+    kernel,
+    bounds,
+    packets,
+    owners,
+    stream,
+    block_dim,
+    max_blocks,
+    grid_stride,
+    extent_parameters=(),
+    scalar_parameters=(),
+):
     native_graph, node = ctypes.c_void_p(), ctypes.c_void_p()
     if not runtime.core.wp_cuda_capture_get_kernel_node(
         stream.cuda_stream, ctypes.byref(native_graph), ctypes.byref(node)
@@ -10806,8 +10827,15 @@ def _record_captured_launch(graph, kernel, bounds, packets, owners, stream, bloc
             block_dim,
             max_blocks,
             grid_stride,
+            extent_parameters,
+            scalar_parameters,
         )
     )
+    # Commit obligations with the canonical record while the launch is still
+    # incomplete. Public preparation APIs correctly reject that transient state.
+    for _, parameter in (*extent_parameters, *scalar_parameters):
+        if not any(parameter is pending for pending in graph._preparation_owners):
+            graph._preparation_owners.append(parameter)
 
 
 class Launch:
@@ -11253,7 +11281,7 @@ def _lean_grid_max_blocks(block_dim: int) -> int:
     return ((1 << 24) // block_dim) * 65535 * 65535
 
 
-def _canonicalize_dim(dim: int | Sequence[int]) -> tuple[int, ...]:
+def _canonicalize_dim(dim: int | Sequence[int], *, allow_parameters=False) -> tuple[int, ...]:
     """Convert a launch dimension into a tuple of Python integers.
 
     ``dim`` may be a scalar integer-like object or any iterable of integer-like
@@ -11267,20 +11295,21 @@ def _canonicalize_dim(dim: int | Sequence[int]) -> tuple[int, ...]:
     Returns:
         A tuple containing one extent per launch dimension.
     """
-    if isinstance(dim, int):
+    accepted = (int, CountParameter) if allow_parameters else (int,)
+    if isinstance(dim, accepted):
         return (dim,)
 
     if isinstance(dim, tuple):
-        if all(isinstance(extent, int) for extent in dim):
+        if all(isinstance(extent, accepted) for extent in dim):
             return dim
-        return tuple(operator.index(extent) for extent in dim)
+        return tuple(extent if isinstance(extent, accepted) else operator.index(extent) for extent in dim)
 
     try:
         iterator = iter(dim)
     except TypeError:
         return (operator.index(dim),)
 
-    return tuple(extent if isinstance(extent, int) else operator.index(extent) for extent in iterator)
+    return tuple(extent if isinstance(extent, accepted) else operator.index(extent) for extent in iterator)
 
 
 def _validate_launch_dim(dim: tuple[int, ...]) -> None:
@@ -11427,6 +11456,13 @@ def launch(
           ``@wp.kernel(grid_stride=False)`` and ``max_blocks > 0`` raises
           a ``RuntimeError``.
         block_dim: The number of threads per block (always 1 for "cpu" devices).
+
+    During a CUDA capture with ``record_launches=True``, :class:`CountParameter`
+    operands may occur in dimensions and int32 scalar arguments. Capture records
+    preserve their identities and use their upper bounds for the initial packet.
+    Replay and graph insertion remain blocked until an external consumer binds
+    all occurrences and completes their preparation obligations. Parameters must
+    address compiled axes; implicit coordinate-multiplier axes are unsupported.
     """
 
     init()
@@ -11460,7 +11496,26 @@ def launch(
             "and cannot be launched with wp.launch()."
         )
 
-    dim, total_dim_size = _normalize_launch_dim(dim)
+    declared_dim = _canonicalize_dim(dim, allow_parameters=True)
+    extent_parameters = tuple(
+        (axis, value) for axis, value in enumerate(declared_dim) if isinstance(value, CountParameter)
+    )
+    scalar_parameters = tuple(
+        (index + 1, value) for index, value in enumerate((*inputs, *outputs)) if isinstance(value, CountParameter)
+    )
+    if extent_parameters or scalar_parameters:
+        if recording is None or record_cmd or runtime.tape is not None:
+            graph = _capture_for_stream(stream or device.stream) if device.is_cuda else None
+            if graph is not None:
+                capture_invalidate(graph, "Count parameters require immediate recorded CUDA launches without a Tape")
+            raise RuntimeError("Count parameters require immediate recorded CUDA launches without a Tape")
+        if any(parameter.maximum >= 2**31 for _, parameter in (*extent_parameters, *scalar_parameters)):
+            raise ValueError("Recorded CUDA count parameters require int32 upper bounds")
+        inputs = tuple(value.maximum if isinstance(value, CountParameter) else value for value in inputs)
+        outputs = tuple(value.maximum if isinstance(value, CountParameter) else value for value in outputs)
+    dim, total_dim_size = _normalize_launch_dim(
+        tuple(value.maximum if isinstance(value, CountParameter) else value for value in declared_dim)
+    )
 
     if total_dim_size > 0:
         fwd_args = []
@@ -11488,6 +11543,12 @@ def launch(
             if recording is not None:
                 raise RuntimeError("Cannot record a launch without a loaded kernel module")
             return
+
+        if any(axis >= kernel.adj.kernel_dim for axis, _ in extent_parameters):
+            raise ValueError("Count parameters must identify compiled launch axes, not folded coordinate multipliers")
+        for index, _ in scalar_parameters:
+            if kernel.adj.args[index - 1].type not in (int, warp.int32):
+                raise TypeError("Count parameters require int32 scalar kernel arguments")
 
         if not kernel.grid_stride and not device.is_cpu:
             if max_blocks > 0:
@@ -11789,7 +11850,17 @@ def launch(
 
             if recording is not None:
                 _record_captured_launch(
-                    recording, kernel, bounds, packets, owners, stream, block_dim, max_blocks, kernel.grid_stride
+                    recording,
+                    kernel,
+                    bounds,
+                    packets,
+                    owners,
+                    stream,
+                    block_dim,
+                    max_blocks,
+                    kernel.grid_stride,
+                    extent_parameters,
+                    scalar_parameters,
                 )
             try:
                 runtime.verify_cuda_device(device)
@@ -11870,7 +11941,7 @@ def launch_tiled(*args, **kwargs):
         if device.is_cpu:
             kwargs["block_dim"] = 1
 
-        dim = _canonicalize_dim(kwargs["dim"])
+        dim = _canonicalize_dim(kwargs["dim"], allow_parameters=True)
 
         if len(dim) > 3:
             raise RuntimeError("wp.launch_tiled() requires a grid with fewer than 4 dimensions")
@@ -14306,6 +14377,8 @@ def copy(
     src_offset: int = 0,
     count: int = 0,
     stream: Stream | None = None,
+    *,
+    extent: tuple[int | CountParameter, ...] | None = None,
 ):
     """Copy array contents from `src` to `dest`.
 
@@ -14316,6 +14389,11 @@ def copy(
         src_offset: Non-negative element offset in the source array
         count: Number of array elements to copy (must be non-negative; copies all elements if set to 0)
         stream: The stream on which to perform the copy
+        extent: Optional logical leading prefix, written as ``(rows, *src.shape[1:])``.
+            Inner dimensions must match both arrays. The leading count must fit
+            both reserved dimensions. Cannot be combined with offsets or ``count``.
+            A :class:`CountParameter` requires recorded CUDA memory operations;
+            callers separately establish accessibility and initialized source data.
 
     The stream, if specified, can be from any device.  If the stream is omitted, then Warp selects a stream based on the following rules:
     (1) If the destination array is on a CUDA device, use the current stream on the destination device.
@@ -14342,7 +14420,26 @@ def copy(
     if memory_graph is not None:
         from warp._src import capture_memory  # noqa: PLC0415
 
-        return capture_memory.copy(memory_graph, dest, src, dest_offset, src_offset, count, stream)
+        return capture_memory.copy(memory_graph, dest, src, dest_offset, src_offset, count, stream, extent=extent)
+
+    if extent is not None:
+        from warp._src import capture_memory  # noqa: PLC0415
+
+        try:
+            if dest_offset or src_offset or count:
+                raise ValueError("Copy extent cannot be combined with offsets or count")
+            declared = capture_memory._prefix_extent(dest, extent)
+            capture_memory._prefix_extent(src, declared)
+            if isinstance(declared[0], CountParameter):
+                raise RuntimeError("Count memory operands require recorded CUDA memory operations")
+            if dest.size == 0 or src.size == 0 or declared[0] == 0:
+                return
+            return copy(dest[: declared[0]], src[: declared[0]], stream=stream)
+        except BaseException as error:
+            graph = _capture_for_stream(stream or operation_device.stream) if operation_device.is_cuda else None
+            if graph is not None:
+                capture_invalidate(graph, f"Failed copy extent: {error}")
+            raise
 
     # Validate the offsets and count before any pointer arithmetic or device work.
     # operator.index() accepts Python and NumPy integers and rejects non-integers
