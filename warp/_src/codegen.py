@@ -4897,6 +4897,9 @@ class Adjoint:
         return adj.add_constant(wrapped)
 
     def eval_indices(adj, target_type, indices):
+        # Indices are values: load references while evaluating each expression,
+        # before later indices can mutate their source. Lvalue provenance must
+        # retain those evaluated values rather than reconstruct pointer indices.
         nodes = indices
         if type_is_composite(target_type):
             indices = []
@@ -4910,7 +4913,7 @@ class Adjoint:
                     slice = adj.add_builtin_call("slice", bounds)
                     indices.append(slice)
                 else:
-                    indices.append(adj.eval(node))
+                    indices.append(adj.load(adj.eval(node)))
 
             return tuple(indices)
         elif is_tile(target_type):
@@ -4930,11 +4933,11 @@ class Adjoint:
                     slice.type.stop_omitted = node.upper is None
                     indices.append(slice)
                 else:
-                    indices.append(adj.resolve_tile_int_index(adj.eval(node), target_type.shape, dim))
+                    indices.append(adj.resolve_tile_int_index(adj.load(adj.eval(node)), target_type.shape, dim))
 
             return tuple(indices)
         else:
-            return tuple(adj.eval(x) for x in nodes)
+            return tuple(adj.load(adj.eval(x)) for x in nodes)
 
     def emit_indexing(adj, target, indices, *, as_target=False):
         target_type = strip_reference(target.type)

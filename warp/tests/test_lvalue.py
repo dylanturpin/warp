@@ -379,6 +379,97 @@ def test_slice(test, device):
     test.assertEqual(y, expected)
 
 
+@wp.struct
+class IndexedSource:
+    poses: wp.array[wp.transform]
+    matrix: wp.array2d[float]
+
+
+@wp.struct
+class IndexedField:
+    sources: wp.array[IndexedSource]
+    source_ids: wp.array[int]
+    indices: wp.array[int]
+
+
+@wp.kernel(enable_backward=False)
+def nested_array_indices(field: IndexedField, out: wp.array[wp.transform]):
+    out[0] = field.sources[field.source_ids[0]].poses[field.indices[0]]
+    field.sources[field.source_ids[1]].matrix[field.indices[1]][field.indices[2]] += 7.0
+
+
+def test_nested_array_indices(test, device):
+    """Chained struct-array reads and writes use index values, not their addresses."""
+    source = IndexedSource()
+    source.poses = wp.array([[1, 2, 3, 0, 0, 0, 1], [4, 5, 6, 0, 0, 0, 1]], dtype=wp.transform, device=device)
+    source.matrix = wp.zeros((2, 2), dtype=float, device=device)
+    field = IndexedField()
+    field.sources = wp.array([source], dtype=IndexedSource, device=device)
+    field.source_ids = wp.zeros(2, dtype=int, device=device)
+    field.indices = wp.array([1, 1, 0], dtype=int, device=device)
+    out = wp.empty(1, dtype=wp.transform, device=device)
+    wp.launch(nested_array_indices, dim=1, inputs=[field], outputs=[out], device=device)
+    assert_np_equal(out.numpy(), np.array([[4, 5, 6, 0, 0, 0, 1]], dtype=np.float32))
+    assert_np_equal(source.matrix.numpy(), np.array([[0, 0], [7, 0]], dtype=np.float32))
+
+
+@wp.kernel(enable_backward=False)
+def nested_view_index_snapshot(field: IndexedField):
+    row = field.sources[field.source_ids[0]].matrix[field.indices[0]]
+    field.source_ids[0] = 1
+    field.indices[0] = 1
+    row[field.indices[1]] += 3.0
+
+
+def test_nested_view_index_snapshot(test, device):
+    """A borrowed row keeps its evaluated source/row after their index storage changes."""
+    sources = [IndexedSource(), IndexedSource()]
+    for source in sources:
+        source.matrix = wp.zeros((2, 2), dtype=float, device=device)
+    field = IndexedField()
+    field.sources = wp.array(sources, dtype=IndexedSource, device=device)
+    field.source_ids = wp.zeros(1, dtype=int, device=device)
+    field.indices = wp.array([0, 1], dtype=int, device=device)
+    wp.launch(nested_view_index_snapshot, dim=1, inputs=[field], device=device)
+    assert_np_equal(sources[0].matrix.numpy(), np.array([[0, 3], [0, 0]], dtype=np.float32))
+    assert_np_equal(sources[1].matrix.numpy(), np.zeros((2, 2), dtype=np.float32))
+
+
+@wp.func
+def change_index(indices: wp.array[int]) -> int:
+    indices[0] = 1
+    return 0
+
+
+@wp.func
+def write_after_index_change(value: wp.ref[float], indices: wp.array[int]):
+    indices[0] = 1
+    value = 11.0
+
+
+@wp.kernel(enable_backward=False)
+def index_expression_order(field: IndexedField, out: wp.array[float]):
+    out[0] = field.sources[field.source_ids[0]].matrix[field.indices[0], change_index(field.indices)]
+    field.indices[0] = 0
+    field.sources[field.source_ids[0]].matrix[field.indices[0], change_index(field.indices)] = 9.0
+    field.indices[0] = 0
+    write_after_index_change(field.sources[field.source_ids[0]].matrix[field.indices[0], 1], field.indices)
+
+
+def test_index_expression_order(test, device):
+    """Later index evaluation and reference callees cannot retarget earlier index values."""
+    source = IndexedSource()
+    source.matrix = wp.array([[2.0, 3.0], [4.0, 5.0]], dtype=float, device=device)
+    field = IndexedField()
+    field.sources = wp.array([source], dtype=IndexedSource, device=device)
+    field.source_ids = wp.zeros(1, dtype=int, device=device)
+    field.indices = wp.zeros(1, dtype=int, device=device)
+    out = wp.empty(1, dtype=float, device=device)
+    wp.launch(index_expression_order, dim=1, inputs=[field], outputs=[out], device=device)
+    assert_np_equal(out.numpy(), np.array([2.0], dtype=np.float32))
+    assert_np_equal(source.matrix.numpy(), np.array([[9, 11], [4, 5]], dtype=np.float32))
+
+
 devices = get_test_devices()
 
 
@@ -435,6 +526,9 @@ add_function_test(TestLValue, "test_array_struct_struct_assign", test_array_stru
 add_function_test(TestLValue, "test_complex", test_complex, devices=devices)
 add_function_test(TestLValue, "test_swizzle", test_swizzle, devices=devices)
 add_function_test(TestLValue, "test_slice", test_slice, devices=devices)
+add_function_test(TestLValue, "test_nested_array_indices", test_nested_array_indices, devices=devices)
+add_function_test(TestLValue, "test_nested_view_index_snapshot", test_nested_view_index_snapshot, devices=devices)
+add_function_test(TestLValue, "test_index_expression_order", test_index_expression_order, devices=devices)
 
 
 if __name__ == "__main__":
