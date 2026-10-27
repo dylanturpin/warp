@@ -4554,6 +4554,128 @@ bool wp_cuda_graph_set_condition(void* context, void* stream, int arch, bool use
 
 
 // ---------------------------------------------------------------------------
+// Virtual memory: a reserved address range backed by granules mapped at the front.
+// The address never moves, so captured graphs keep their pointers while the backing changes.
+// Budgets, handle pools and readiness are the owner's; this is reserve, map, unmap, free.
+// ---------------------------------------------------------------------------
+
+static bool vmem_allocation_prop(void* context, CUmemAllocationProp* prop)
+{
+    ContextInfo* context_info = get_context_info(context);
+    if (!context_info || !context_info->device_info) {
+        wp::set_error_string("Warp error: unknown CUDA context");
+        return false;
+    }
+    std::memset(prop, 0, sizeof(*prop));
+    prop->type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop->location.id = int(context_info->device_info->device);
+    return true;
+}
+
+int wp_cuda_vmem_supported(void* context)
+{
+    ContextInfo* context_info = get_context_info(context);
+    if (!context_info || !context_info->device_info)
+        return 0;
+    int supported = 0;
+    if (!check_cu(cuDeviceGetAttribute_f(
+            &supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, context_info->device_info->device
+        )))
+        return 0;
+    return supported ? 1 : 0;
+}
+
+bool wp_cuda_vmem_granularity(void* context, size_t* granularity_out)
+{
+    ContextGuard guard(context);
+    CUmemAllocationProp prop;
+    if (!vmem_allocation_prop(context, &prop))
+        return false;
+    return check_cu(cuMemGetAllocationGranularity_f(granularity_out, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+}
+
+bool wp_cuda_vmem_reserve(void* context, size_t size, size_t alignment, void** address_out)
+{
+    ContextGuard guard(context);
+    CUdeviceptr ptr = 0;
+    if (!check_cu(cuMemAddressReserve_f(&ptr, size, alignment, 0, 0)))
+        return false;
+    *address_out = reinterpret_cast<void*>(static_cast<uintptr_t>(ptr));
+    return true;
+}
+
+bool wp_cuda_vmem_address_free(void* context, void* address, size_t size)
+{
+    ContextGuard guard(context);
+    return check_cu(cuMemAddressFree_f(static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(address)), size));
+}
+
+// Create and map one handle per granule over [address, address + size), then grant read and
+// write access to the whole new range at once. On failure every new granule is unmapped and
+// released, and nothing of the previous mapping changes.
+bool wp_cuda_vmem_map(void* context, void* address, size_t size, size_t granule, unsigned long long* handles_out)
+{
+    ContextGuard guard(context);
+    CUmemAllocationProp prop;
+    if (!vmem_allocation_prop(context, &prop))
+        return false;
+    if (granule == 0 || size == 0 || size % granule != 0 || !handles_out) {
+        wp::set_error_string("Warp error: virtual memory maps whole granules");
+        return false;
+    }
+    CUdeviceptr base = static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(address));
+    size_t count = size / granule;
+    size_t created = 0, mapped = 0;
+    bool ok = true;
+    for (size_t i = 0; i < count && ok; ++i) {
+        CUmemGenericAllocationHandle handle = 0;
+        if (!check_cu(cuMemCreate_f(&handle, granule, &prop, 0))) {
+            ok = false;
+            break;
+        }
+        handles_out[i] = handle;
+        created = i + 1;
+        if (!check_cu(cuMemMap_f(base + i * granule, granule, 0, handle, 0))) {
+            ok = false;
+            break;
+        }
+        mapped = i + 1;
+    }
+    if (ok) {
+        CUmemAccessDesc desc;
+        std::memset(&desc, 0, sizeof(desc));
+        desc.location = prop.location;
+        desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        ok = check_cu(cuMemSetAccess_f(base, size, &desc, 1));
+    }
+    if (!ok) {
+        for (size_t i = 0; i < mapped; ++i)
+            cuMemUnmap_f(base + i * granule, granule);
+        for (size_t i = 0; i < created; ++i)
+            cuMemRelease_f(handles_out[i]);
+        return false;
+    }
+    return true;
+}
+
+// Unmap [address, address + size) and release its handles. The caller has made sure no work
+// still reads the range.
+bool wp_cuda_vmem_unmap(void* context, void* address, size_t size, size_t granule, const unsigned long long* handles)
+{
+    ContextGuard guard(context);
+    if (granule == 0 || size % granule != 0 || !handles) {
+        wp::set_error_string("Warp error: virtual memory unmaps whole granules");
+        return false;
+    }
+    CUdeviceptr base = static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(address));
+    bool ok = check_cu(cuMemUnmap_f(base, size));
+    for (size_t i = 0; i < size / granule; ++i)
+        ok = check_cu(cuMemRelease_f(handles[i])) && ok;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Count binding for recorded launches: device-updatable kernel nodes whose
 // launch bounds, grid and int32 scalar arguments follow live device counts.
 // The updater kernel runs as an ordinary node ahead of the launches it updates.

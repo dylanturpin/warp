@@ -1196,6 +1196,19 @@ wp_cuda_graph_set_condition(void* context, void* stream, int arch, bool use_ptx,
 WP_API bool wp_cuda_graph_pause_capture(void* context, void* stream, void** graph_ret) { return false; }
 WP_API bool wp_cuda_graph_resume_capture(void* context, void* stream, void* graph) { return false; }
 WP_API bool wp_cuda_graph_insert_child_graph(void* context, void* stream, void* child_graph) { return false; }
+WP_API int wp_cuda_vmem_supported(void* context) { return 0; }
+WP_API bool wp_cuda_vmem_granularity(void* context, size_t* granularity_out) { return false; }
+WP_API bool wp_cuda_vmem_reserve(void* context, size_t size, size_t alignment, void** address_out) { return false; }
+WP_API bool wp_cuda_vmem_address_free(void* context, void* address, size_t size) { return false; }
+WP_API bool wp_cuda_vmem_map(void* context, void* address, size_t size, size_t granule, unsigned long long* handles_out)
+{
+    return false;
+}
+WP_API bool
+wp_cuda_vmem_unmap(void* context, void* address, size_t size, size_t granule, const unsigned long long* handles)
+{
+    return false;
+}
 WP_API int wp_cuda_count_binding_size() { return 0; }
 WP_API bool wp_cuda_count_updater_launch(
     void* context, void* stream, int arch, bool use_ptx, void* bindings, int count, void* errors

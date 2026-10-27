@@ -799,6 +799,16 @@ WP_API bool wp_cuda_graph_pause_capture(void* context, void* stream, void** grap
 WP_API bool wp_cuda_graph_resume_capture(void* context, void* stream, void* graph);
 WP_API bool wp_cuda_graph_insert_child_graph(void* context, void* stream, void* child_graph);
 
+// virtual memory: reserve, map granules at the front, unmap, free (CUDA 10.2+ driver API)
+WP_API int wp_cuda_vmem_supported(void* context);
+WP_API bool wp_cuda_vmem_granularity(void* context, size_t* granularity_out);
+WP_API bool wp_cuda_vmem_reserve(void* context, size_t size, size_t alignment, void** address_out);
+WP_API bool wp_cuda_vmem_address_free(void* context, void* address, size_t size);
+WP_API bool
+wp_cuda_vmem_map(void* context, void* address, size_t size, size_t granule, unsigned long long* handles_out);
+WP_API bool
+wp_cuda_vmem_unmap(void* context, void* address, size_t size, size_t granule, const unsigned long long* handles);
+
 // count binding for recorded launches (device-updatable kernel nodes, CUDA 12.4+)
 WP_API int wp_cuda_count_binding_size();
 WP_API bool wp_cuda_count_updater_launch(

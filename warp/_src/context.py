@@ -7785,6 +7785,35 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_void_p),
             ]
             self.core.wp_cuda_capture_get_kernel_node.restype = ctypes.c_bool
+            self.core.wp_cuda_vmem_supported.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_vmem_supported.restype = ctypes.c_int
+            self.core.wp_cuda_vmem_granularity.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+            self.core.wp_cuda_vmem_granularity.restype = ctypes.c_bool
+            self.core.wp_cuda_vmem_reserve.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            self.core.wp_cuda_vmem_reserve.restype = ctypes.c_bool
+            self.core.wp_cuda_vmem_address_free.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            self.core.wp_cuda_vmem_address_free.restype = ctypes.c_bool
+            self.core.wp_cuda_vmem_map.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            self.core.wp_cuda_vmem_map.restype = ctypes.c_bool
+            self.core.wp_cuda_vmem_unmap.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            self.core.wp_cuda_vmem_unmap.restype = ctypes.c_bool
             self.core.wp_cuda_count_binding_size.argtypes = []
             self.core.wp_cuda_count_binding_size.restype = ctypes.c_int
             self.core.wp_cuda_count_updater_launch.argtypes = [

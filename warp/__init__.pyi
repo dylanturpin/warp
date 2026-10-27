@@ -201,6 +201,7 @@ from warp._src.context import capture_complete_preparation as capture_complete_p
 from warp._src.context import capture_update_counts as capture_update_counts
 from warp._src.context import capture_get_count_update_errors as capture_get_count_update_errors
 from warp._src.context import capture_get_count_bound_launches as capture_get_count_bound_launches
+from warp._src.reservation import Reservation as Reservation
 from warp._src.context import capture_begin as capture_begin
 from warp._src.context import capture_end as capture_end
 from warp._src.context import capture_launch as capture_launch

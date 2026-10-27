@@ -59,6 +59,21 @@ CUresult cuDevicePrimaryCtxRetain_f(CUcontext* ctx, CUdevice dev);
 CUresult cuDevicePrimaryCtxRelease_f(CUdevice dev);
 CUresult cuDeviceCanAccessPeer_f(int* can_access, CUdevice dev, CUdevice peer_dev);
 CUresult cuMemGetInfo_f(size_t* free, size_t* total);
+// virtual memory management (CUDA 10.2+)
+CUresult cuMemGetAllocationGranularity_f(
+    size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option
+);
+CUresult
+cuMemAddressReserve_f(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags);
+CUresult cuMemAddressFree_f(CUdeviceptr ptr, size_t size);
+CUresult cuMemCreate_f(
+    CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags
+);
+CUresult cuMemRelease_f(CUmemGenericAllocationHandle handle);
+CUresult
+cuMemMap_f(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags);
+CUresult cuMemUnmap_f(CUdeviceptr ptr, size_t size);
+CUresult cuMemSetAccess_f(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count);
 #if CUDA_VERSION >= 12080
 // batched memcpy
 CUresult cuMemcpyBatchAsync_f(

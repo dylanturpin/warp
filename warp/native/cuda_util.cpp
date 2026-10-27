@@ -73,6 +73,14 @@ static PFN_cuDevicePrimaryCtxRetain_v7000 pfn_cuDevicePrimaryCtxRetain;
 static PFN_cuDevicePrimaryCtxRelease_v11000 pfn_cuDevicePrimaryCtxRelease;
 static PFN_cuDeviceCanAccessPeer_v4000 pfn_cuDeviceCanAccessPeer;
 static PFN_cuMemGetInfo_v3020 pfn_cuMemGetInfo;
+static PFN_cuMemGetAllocationGranularity_v10020 pfn_cuMemGetAllocationGranularity;
+static PFN_cuMemAddressReserve_v10020 pfn_cuMemAddressReserve;
+static PFN_cuMemAddressFree_v10020 pfn_cuMemAddressFree;
+static PFN_cuMemCreate_v10020 pfn_cuMemCreate;
+static PFN_cuMemRelease_v10020 pfn_cuMemRelease;
+static PFN_cuMemMap_v10020 pfn_cuMemMap;
+static PFN_cuMemUnmap_v10020 pfn_cuMemUnmap;
+static PFN_cuMemSetAccess_v10020 pfn_cuMemSetAccess;
 #if CUDA_VERSION >= 12080
 static PFN_cuMemcpyBatchAsync_v12080 pfn_cuMemcpyBatchAsync;
 #endif
@@ -255,6 +263,14 @@ bool init_cuda_driver()
     get_driver_entry_point("cuDevicePrimaryCtxRelease", 11000, &(void*&)pfn_cuDevicePrimaryCtxRelease);
     get_driver_entry_point("cuDeviceCanAccessPeer", 4000, &(void*&)pfn_cuDeviceCanAccessPeer);
     get_driver_entry_point("cuMemGetInfo", 3020, &(void*&)pfn_cuMemGetInfo);
+    get_driver_entry_point("cuMemGetAllocationGranularity", 10020, &(void*&)pfn_cuMemGetAllocationGranularity);
+    get_driver_entry_point("cuMemAddressReserve", 10020, &(void*&)pfn_cuMemAddressReserve);
+    get_driver_entry_point("cuMemAddressFree", 10020, &(void*&)pfn_cuMemAddressFree);
+    get_driver_entry_point("cuMemCreate", 10020, &(void*&)pfn_cuMemCreate);
+    get_driver_entry_point("cuMemRelease", 10020, &(void*&)pfn_cuMemRelease);
+    get_driver_entry_point("cuMemMap", 10020, &(void*&)pfn_cuMemMap);
+    get_driver_entry_point("cuMemUnmap", 10020, &(void*&)pfn_cuMemUnmap);
+    get_driver_entry_point("cuMemSetAccess", 10020, &(void*&)pfn_cuMemSetAccess);
 #if CUDA_VERSION >= 12080
     if (driver_version >= 12080)
         get_driver_entry_point("cuMemcpyBatchAsync", 12080, &(void*&)pfn_cuMemcpyBatchAsync);
@@ -676,6 +692,54 @@ CUresult cuDeviceCanAccessPeer_f(int* can_access, CUdevice dev, CUdevice peer_de
 CUresult cuMemGetInfo_f(size_t* free, size_t* total)
 {
     return pfn_cuMemGetInfo ? pfn_cuMemGetInfo(free, total) : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuMemGetAllocationGranularity_f(
+    size_t* granularity, const CUmemAllocationProp* prop, CUmemAllocationGranularity_flags option
+)
+{
+    return pfn_cuMemGetAllocationGranularity ? pfn_cuMemGetAllocationGranularity(granularity, prop, option)
+                                             : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult
+cuMemAddressReserve_f(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags)
+{
+    return pfn_cuMemAddressReserve ? pfn_cuMemAddressReserve(ptr, size, alignment, addr, flags)
+                                   : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuMemAddressFree_f(CUdeviceptr ptr, size_t size)
+{
+    return pfn_cuMemAddressFree ? pfn_cuMemAddressFree(ptr, size) : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuMemCreate_f(
+    CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags
+)
+{
+    return pfn_cuMemCreate ? pfn_cuMemCreate(handle, size, prop, flags) : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuMemRelease_f(CUmemGenericAllocationHandle handle)
+{
+    return pfn_cuMemRelease ? pfn_cuMemRelease(handle) : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult
+cuMemMap_f(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags)
+{
+    return pfn_cuMemMap ? pfn_cuMemMap(ptr, size, offset, handle, flags) : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuMemUnmap_f(CUdeviceptr ptr, size_t size)
+{
+    return pfn_cuMemUnmap ? pfn_cuMemUnmap(ptr, size) : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuMemSetAccess_f(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count)
+{
+    return pfn_cuMemSetAccess ? pfn_cuMemSetAccess(ptr, size, desc, count) : DRIVER_ENTRY_POINT_ERROR;
 }
 
 #if CUDA_VERSION >= 12080
