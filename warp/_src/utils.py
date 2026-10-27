@@ -1963,6 +1963,8 @@ class ScopedCapture:
         record_launches: Retain immutable CUDA kernel launch records; see :func:`capture_get_launches`.
         record_memory_operations: Lower supported array fills/copies to recorded kernels;
             requires ``record_launches=True``. See :func:`capture_begin`.
+        count_sources: ``(count, source)`` pairs for :func:`capture_update_counts` to take its
+            sources from; requires ``record_launches=True``. See :func:`capture_begin`.
         capture_mode: The :class:`~warp.CaptureMode` to use when opening
             the capture. Defaults to :attr:`CaptureMode.THREAD_LOCAL`.
             See :func:`capture_begin` for details.
@@ -1994,6 +1996,7 @@ class ScopedCapture:
         capture_mode: CaptureMode = CaptureMode.THREAD_LOCAL,
         record_launches: bool = False,
         record_memory_operations: bool = False,
+        count_sources=None,
     ):
         self.device = device
         self.stream = stream
@@ -2003,6 +2006,7 @@ class ScopedCapture:
         self.capture_mode = capture_mode
         self.record_launches = record_launches
         self.record_memory_operations = record_memory_operations
+        self.count_sources = count_sources
         self.active = False
         self.graph = None
 
@@ -2017,6 +2021,7 @@ class ScopedCapture:
                 capture_mode=self.capture_mode,
                 record_launches=self.record_launches,
                 record_memory_operations=self.record_memory_operations,
+                count_sources=self.count_sources,
             )
             self.active = True
             return self

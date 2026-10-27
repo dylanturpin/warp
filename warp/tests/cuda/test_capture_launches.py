@@ -1416,6 +1416,73 @@ class TestCountParameters(unittest.TestCase):
             np.testing.assert_array_equal(target.numpy(), 4)
 
 
+def test_count_update_split_spelling(test, device):
+    # The other spelling of the same binder: the sources are declared on the capture and the update
+    # point names only the counts (or nothing, for all of them). Same replays, same executable.
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        other = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        conflicting = wp.zeros(1, dtype=wp.int32)
+        values = wp.zeros(8, dtype=int)
+        wp.load_module(device=device)
+
+        def check(graph, live):
+            values.zero_()
+            source.fill_(live)
+            wp.capture_launch(graph)
+            expected = np.zeros(8, dtype=np.int32)
+            expected[:live] = np.arange(1, live + 1) + live * 100
+            np.testing.assert_array_equal(values.numpy(), expected)
+            np.testing.assert_array_equal(wp.capture_get_count_update_errors(graph).numpy(), [0])
+
+        with wp.ScopedCapture(record_launches=True, count_sources=((count, source),)) as capture:
+            wp.capture_update_counts((count,))
+            wp.launch(write_index, count, [values, count])
+        graph = capture.graph
+        test.assertEqual(len(wp.capture_get_count_bound_launches(graph)), 1)
+        exec_handle = None
+        for live in (4, 0, 8, 1):
+            check(graph, live)
+            if exec_handle is None:
+                exec_handle = graph.graph_exec.value
+            test.assertEqual(graph.graph_exec.value, exec_handle)
+        # No counts named: every declared count is bound.
+        with wp.ScopedCapture(record_launches=True, count_sources=[(count, source)]) as capture:
+            wp.capture_update_counts()
+            wp.launch(write_index, count, [values, count])
+        check(capture.graph, 3)
+        # The one-call spelling still works inside a capture with declarations, as long as it agrees.
+        with wp.ScopedCapture(record_launches=True, count_sources=((count, source),)) as capture:
+            with test.assertRaisesRegex(ValueError, "no source"):
+                wp.capture_update_counts((other,))
+            with test.assertRaisesRegex(ValueError, "Conflicting source"):
+                wp.capture_update_counts((count,), (conflicting,))
+            wp.capture_update_counts((count,), (source,))
+            wp.launch(write_index, count, [values, count])
+        check(capture.graph, 2)
+        # Declarations are validated before the capture opens; an update point with nothing to bind is refused.
+        with test.assertRaisesRegex(ValueError, "record_launches"):
+            wp.capture_begin(count_sources=((count, source),))
+        with test.assertRaisesRegex(ValueError, "CountParameter"):
+            wp.capture_begin(record_launches=True, count_sources=((5, source),))
+        with test.assertRaisesRegex(ValueError, "Count sources"):
+            wp.capture_begin(record_launches=True, count_sources=((count, wp.zeros(2, dtype=wp.int32)),))
+        with test.assertRaisesRegex(ValueError, "once"):
+            wp.capture_begin(record_launches=True, count_sources=((count, source), (count, source)))
+        with test.assertRaisesRegex(ValueError, "pairs"):
+            wp.capture_begin(record_launches=True, count_sources=(count,))
+        with test.assertRaisesRegex(ValueError, "external"):
+            wp.capture_begin(record_launches=True, external=True, count_sources=((count, source),))
+        with wp.ScopedCapture(record_launches=True) as capture:
+            with test.assertRaisesRegex(ValueError, "count_sources"):
+                wp.capture_update_counts()
+            wp.launch(write_index, 4, [values, 4])
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(values.numpy()[:4], np.arange(1, 5) + 400)
+
+
 class TestCaptureLaunches(unittest.TestCase):
     def test_argument_owner_release_without_cyclic_gc(self):
         was_enabled = gc.isenabled()
@@ -1503,6 +1570,7 @@ for test_func in (
     test_count_update_shared_sources_and_repeated_counts,
     test_count_update_in_graph_guard,
     test_count_update_tiled_rank3_and_grid_caps,
+    test_count_update_split_spelling,
     test_count_update_rejects_launch_forked_before_update_point,
 ):
     add_function_test(TestCaptureLaunches, test_func.__name__, test_func, devices=get_selected_cuda_test_devices())

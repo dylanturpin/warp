@@ -6118,6 +6118,8 @@ class Graph:
         self._capture_error: str | None = None
         self._preparation_owners: list[Any] = []
         self._count_update: CountUpdate | None = None
+        # (count, source) pairs declared with count_sources= at capture_begin, for update points that name only counts
+        self._count_sources: tuple = ()
         self._external = False
         self.module_execs: set[ModuleExec] = set()
         self._deterministic_buffer_refs: list[Any] = []
@@ -13149,9 +13151,37 @@ def _validate_capture_insertion(graph, parent):
         raise
 
 
+def _check_count_source(source, device):
+    if (
+        not isinstance(source, warp.array)
+        or source.dtype is not warp.int32
+        or source.shape != (1,)
+        or not source.is_contiguous
+        or not source.ptr
+        or source.device != device
+    ):
+        raise ValueError("Count sources must be contiguous int32 CUDA arrays of shape (1,) on the capture device")
+
+
+def _check_count_sources(pairs, device):
+    """Validate ``count_sources`` pairs for :func:`capture_begin`: CountParameter identities, each once, one source each."""
+    checked = []
+    for pair in pairs:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise ValueError("count_sources takes (count, source) pairs")
+        count, source = pair
+        if not isinstance(count, CountParameter):
+            raise ValueError("Count sources bind CountParameter identities")
+        if any(count is other for other, _ in checked):
+            raise ValueError("Count sources name each CountParameter once")
+        _check_count_source(source, device)
+        checked.append((count, source))
+    return tuple(checked)
+
+
 def capture_update_counts(
-    counts: Sequence[CountParameter],
-    sources: Sequence[warp.array],
+    counts: Sequence[CountParameter] | None = None,
+    sources: Sequence[warp.array] | None = None,
     *,
     errors: warp.array | None = None,
     stream: Stream | None = None,
@@ -13197,9 +13227,18 @@ def capture_update_counts(
     capture is open on the device at that moment. Requires CUDA Toolkit and
     driver 12.4 or newer.
 
+    Two spellings bind the same way. One call: ``capture_update_counts(counts, sources)``.
+    Split: declare the pairs on the capture, ``capture_begin(..., count_sources=((n, live),))``
+    or ``ScopedCapture(..., count_sources=...)``, and name only the counts here,
+    ``capture_update_counts((n,))``, or nothing at all to bind every declared count. A count
+    named here must have a source from one of the two; giving a different array for a
+    declared count is refused.
+
     Args:
-        counts: The :class:`CountParameter` identities to bind.
-        sources: One int32 device array of shape ``(1,)`` per count.
+        counts: The :class:`CountParameter` identities to bind; ``None`` binds every count
+          declared with ``count_sources`` on the capture.
+        sources: One int32 device array of shape ``(1,)`` per count; ``None`` takes the
+          sources declared on the capture.
         errors: Optional int32 device array that receives the error words.
         stream: The capturing CUDA stream (the device's current stream if ``None``).
 
@@ -13207,7 +13246,9 @@ def capture_update_counts(
         RuntimeError: If no recorded capture is active on the stream, the capture
           is external, the capture already has an update point, or the toolkit
           or driver is older than 12.4.
-        ValueError: If a count, a source or ``errors`` is not of the required kind.
+        ValueError: If a count, a source or ``errors`` is not of the required kind; if a named
+          count has no source in either place, or its explicit source differs from the declared
+          one; if nothing is named and nothing was declared.
     """
     if not is_conditional_graph_supported():
         raise RuntimeError("Count updates require Warp built with CUDA Toolkit 12.4+ and a CUDA 12.4+ driver")
@@ -13229,25 +13270,40 @@ def capture_update_counts(
         capture_invalidate(graph, "A capture takes one count update point")
         raise RuntimeError("A capture takes one count update point")
 
-    counts = tuple(counts)
-    sources = tuple(sources)
-    if not counts or len(counts) != len(sources):
-        raise ValueError("Count updates need one source per count and at least one count")
+    declared = graph._count_sources
+    if counts is None:
+        if not declared:
+            raise ValueError("Count updates need counts, or count_sources declared on the capture")
+        counts = tuple(count for count, _ in declared)
+    else:
+        counts = tuple(counts)
     for index, count in enumerate(counts):
         if not isinstance(count, CountParameter):
             raise ValueError("Count updates bind CountParameter identities")
         if any(count is other for other in counts[:index]):
             raise ValueError("Count updates name each CountParameter once")
+    if sources is None:
+        resolved = []
+        for count in counts:
+            for other, source in declared:
+                if other is count:
+                    resolved.append(source)
+                    break
+            else:
+                raise ValueError(
+                    "A count has no source: declare it with count_sources= on the capture or pass sources= here"
+                )
+        sources = tuple(resolved)
+    else:
+        sources = tuple(sources)
+        for count, source in zip(counts, sources, strict=False):
+            for other, declared_source in declared:
+                if other is count and isinstance(source, warp.array) and declared_source.ptr != source.ptr:
+                    raise ValueError("Conflicting source for a count declared with count_sources on the capture")
+    if not counts or len(counts) != len(sources):
+        raise ValueError("Count updates need one source per count and at least one count")
     for source in sources:
-        if (
-            not isinstance(source, warp.array)
-            or source.dtype is not warp.int32
-            or source.shape != (1,)
-            or not source.is_contiguous
-            or not source.ptr
-            or source.device != device
-        ):
-            raise ValueError("Count sources must be contiguous int32 CUDA arrays of shape (1,) on the capture device")
+        _check_count_source(source, device)
     if errors is not None and (
         not isinstance(errors, warp.array)
         or errors.dtype is not warp.int32
@@ -13493,6 +13549,7 @@ def capture_begin(
     capture_mode: CaptureMode = CaptureMode.THREAD_LOCAL,
     record_launches: bool = False,
     record_memory_operations: bool = False,
+    count_sources: Sequence[tuple[CountParameter, warp.array]] | None = None,
 ):
     """Begin capture of a graph.
 
@@ -13533,6 +13590,12 @@ def capture_begin(
           equal shapes and element byte sizes on the captured CUDA device.
           Partial copies, overlapping payloads, indexed arrays and autodiff
           arrays are rejected. No allocation or execution-count inference occurs.
+        count_sources: Optional ``(count, source)`` pairs connecting :class:`CountParameter`
+          identities to their live int32 device values for this capture, so that
+          :func:`capture_update_counts` may name only the counts (or nothing, for all of
+          them). Requires ``record_launches=True`` and a capture Warp ends itself. A count
+          may be given its source here, at :func:`capture_update_counts`, or in both places
+          when they agree.
         capture_mode: The :class:`~warp.CaptureMode` (i.e.
           ``cudaStreamCaptureMode``) used when Warp opens the capture.
           Defaults to :attr:`CaptureMode.THREAD_LOCAL`. Use
@@ -13551,6 +13614,11 @@ def capture_begin(
         raise ValueError("Kernel launch records require CUDA capture without APIC")
     if record_memory_operations and not record_launches:
         raise ValueError("Memory operation records require record_launches=True")
+    if count_sources and not record_launches:
+        raise ValueError("Count sources require record_launches=True")
+    if count_sources and external:
+        raise ValueError("Count sources need a capture that Warp ends and instantiates itself, not an external capture")
+    declared_sources = _check_count_sources(count_sources, device) if count_sources else ()
 
     # Reject nested captures
     if runtime._apic_capture is not None:
@@ -13636,6 +13704,7 @@ def capture_begin(
     graph = Graph(device, capture_id)
     graph._record_launches = record_launches
     graph._record_memory_operations = record_memory_operations
+    graph._count_sources = declared_sources
     graph._external = external
 
     # Attach APIC capture state if recording
