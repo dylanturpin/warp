@@ -29,6 +29,18 @@ map_cache: dict[tuple, tuple] = {}
 
 
 # expand a 7-vec to a tuple of arrays
+def _require_whole_arrays(operation, *arrays, count=None):
+    """Refuse a native over an array placed on a Reservation when the elements it reads are not all mapped.
+
+    With ``count`` (the elements the native reads from the front of a 1-D array) only that prefix is checked;
+    otherwise the whole array is.
+    """
+    for a in arrays:
+        if a is not None and getattr(a, "_backing", None) is not None:
+            rows = count if (count is not None and a.ndim == 1 and 0 <= count <= a.shape[0]) else None
+            a._require_mapped(operation, rows=rows)
+
+
 def transform_expand(t):
     """Expand a flat 7-element sequence into a :class:`warp.transformf` (position + quaternion)."""
     return wp.transform(np.array(t[0:3]), np.array(t[3:7]))
@@ -71,6 +83,7 @@ def array_scan(in_array: wp.array, out_array: wp.array, inclusive: bool = True) 
           array during CPU graph capture or CUDA graph capture with
           ``apic=True``.
     """
+    _require_whole_arrays("array_scan", in_array, out_array)
 
     if in_array.device != out_array.device:
         raise RuntimeError(f"In and out array storage devices do not match ({in_array.device} vs {out_array.device})")
@@ -161,6 +174,7 @@ def radix_sort_pairs(
     Raises:
         RuntimeError: If array storage devices don't match, if storage size is insufficient, or if data types are unsupported.
     """
+    _require_whole_arrays("radix_sort_pairs", keys, values, count=2 * count)
     if keys.device != values.device:
         raise RuntimeError(f"Keys and values array storage devices do not match ({keys.device} vs {values.device})")
 
@@ -283,6 +297,8 @@ def segmented_sort_pairs(
         RuntimeError: If array storage devices don't match, if storage size is insufficient,
                      if segment_start_indices is not of type int32, or if data types are unsupported.
     """
+    _require_whole_arrays("segmented_sort_pairs", keys, values, count=2 * count)
+    _require_whole_arrays("segmented_sort_pairs", segment_start_indices, segment_end_indices)
     if keys.device != values.device:
         raise RuntimeError(f"Array storage devices do not match ({keys.device} vs {values.device})")
 
@@ -402,6 +418,7 @@ def runlength_encode(
         NotImplementedError: If ``run_count`` is ``None`` for a non-empty call
           during CPU graph capture or CUDA graph capture with ``apic=True``.
     """
+    _require_whole_arrays("runlength_encode", values, run_values, run_lengths, run_count)
     if run_values.device != values.device or run_lengths.device != values.device:
         raise RuntimeError("run_values, run_lengths and values storage devices do not match")
 
@@ -550,6 +567,8 @@ def array_sum(
             ``out``. Also raised if any input or output array has a negative
             stride during APIC recording, including for a zero-count call.
     """
+    _require_whole_arrays("array_sum", values, count=value_count if axis is None else None)
+    _require_whole_arrays("array_sum", out)
     if value_count is None:
         if axis is None:
             value_count = values.size
@@ -687,6 +706,8 @@ def array_inner(
             ``out``. Also raised if any input or output array has a negative
             stride during APIC recording, including for a zero-count call.
     """
+    _require_whole_arrays("array_inner", a, b, count=count if axis is None else None)
+    _require_whole_arrays("array_inner", out)
     if a.size != b.size:
         raise RuntimeError(f"A and b array storage sizes do not match ({a.size} vs {b.size})")
 
@@ -833,6 +854,7 @@ def array_cast(in_array: warp.array, out_array: warp.array, count: int | None = 
         If the input and output arrays have the same data type, this function will
         simply copy the data without any conversion.
     """
+    _require_whole_arrays("array_cast", in_array, out_array, count=count)
     if in_array.device != out_array.device:
         raise RuntimeError(f"Array storage devices do not match ({in_array.device} vs {out_array.device})")
 

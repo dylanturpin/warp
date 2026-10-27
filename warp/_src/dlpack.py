@@ -226,6 +226,8 @@ def to_dlpack(wp_array: warp.array):
         A capsule containing a DLManagedTensor that can be converted
         to another array type without copying the underlying memory.
     """
+    if getattr(wp_array, "_backing", None) is not None:
+        wp_array._require_mapped("to_dlpack")  # the consumer cannot know the mapped prefix
 
     # DLPack does not support structured arrays
     if isinstance(wp_array.dtype, warp._src.codegen.Struct):

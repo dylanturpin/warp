@@ -3373,6 +3373,7 @@ class array(Array[DType, NDim]):
         grad: array | None = None,
         requires_grad: builtins.bool = False,
         retain_grad: builtins.bool = False,
+        backing: Any = None,
     ):
         """Construct a new Warp array object.
 
@@ -3411,6 +3412,9 @@ class array(Array[DType, NDim]):
                 then a gradient array will be allocated automatically.
             pinned: Whether to allocate pinned host memory, which allows asynchronous host–device transfers
                 (only applicable with ``device="cpu"``)
+            backing: A :class:`warp.Reservation` the array is placed over, at ``ptr`` (its address if ``ptr`` is
+                ``None``); the array retains the reservation, may cover rows that are not mapped yet, and
+                whole-array operations raise while any addressed byte is unmapped. ``deleter`` is then the reservation's.
 
         """  # noqa: RUF002
 
@@ -3426,6 +3430,8 @@ class array(Array[DType, NDim]):
 
         # reference to other array
         self._ref = None
+        # the Reservation this array is a view over, if any (see warp.Reservation)
+        self._backing = None
 
         # canonicalize dtype
         if dtype is int:
@@ -3451,6 +3457,24 @@ class array(Array[DType, NDim]):
                         f"Failed to create array with shape {shape}, the maximum number of dimensions is {ARRAY_MAX_DIMS}"
                     )
 
+        if backing is not None:
+            if not all(hasattr(backing, name) for name in ("_attach", "covers_bytes", "address", "device")):
+                raise TypeError("backing must be a warp.Reservation")
+            if data is not None:
+                raise RuntimeError("An array over a reservation is placed with `ptr`, not constructed from `data`")
+            if deleter is not None:
+                raise ValueError("An array over a reservation is released by the reservation; do not pass `deleter`")
+            if shape is None:
+                raise ValueError("An array over a reservation needs a shape")
+            if ptr is None:
+                ptr = backing.address
+            if device is None:
+                device = backing.device
+            if requires_grad and grad is None:
+                raise ValueError(
+                    "requires_grad=True on an array over a reservation needs grad= (a view over a reservation mapped in step)"
+                )
+
         # determine the construction path from the given arguments
         if data is not None:
             # data or ptr, not both
@@ -3459,6 +3483,8 @@ class array(Array[DType, NDim]):
             self._init_from_data(data, dtype, shape, device, copy, pinned)
         elif ptr is not None:
             self._init_from_ptr(ptr, dtype, shape, strides, capacity, device, pinned, deleter)
+            if backing is not None:
+                backing._attach(self)
         elif shape is not None:
             self._init_new(dtype, shape, strides, device, pinned)
         else:
@@ -4077,6 +4103,9 @@ class array(Array[DType, NDim]):
 
         if self.device is None:
             raise RuntimeError("Array has no device assigned")
+        if self._backing is not None:
+            # exporting the pointer hands the whole capacity to a consumer that cannot know the mapped prefix
+            self._require_mapped("dlpack")
 
         # check if synchronization is needed
         if stream != -1:
@@ -4122,6 +4151,9 @@ class array(Array[DType, NDim]):
         if self.device is None:
             # for 'empty' arrays we just return the type information, these are used in kernel function signatures
             return f"array{self.dtype}"
+        elif self._backing is not None and not self._is_mapped():
+            # a partially mapped array cannot be read whole; describe it instead of faulting
+            return f"{type_repr(self)} over {self._backing!r}"
         else:
             return str(self.numpy())
 
@@ -4228,6 +4260,7 @@ class array(Array[DType, NDim]):
             )
             # store back-ref to stop data being destroyed
             new_grad._ref = self.grad
+            new_grad._backing = self.grad._backing
         else:
             new_grad = None
 
@@ -4243,6 +4276,7 @@ class array(Array[DType, NDim]):
 
         # store back-ref to stop data being destroyed
         a._ref = self
+        a._backing = self._backing
 
         if index_arrays:
             indices = [None] * self.ndim
@@ -4322,6 +4356,10 @@ class array(Array[DType, NDim]):
         if value and is_native_type(self.dtype):
             raise ValueError("Native value-type arrays do not support automatic differentiation")
         if value and self._grad is None:
+            if self._backing is not None:
+                raise ValueError(
+                    "requires_grad on an array over a reservation needs an explicit grad (a view over a reservation mapped in step)"
+                )
             self._alloc_grad()
         elif not value:
             self._grad = None
@@ -4359,6 +4397,58 @@ class array(Array[DType, NDim]):
             "shape": warp._src.codegen.Var("shape", shape_t),
             "ptr": warp._src.codegen.Var("data", pointer_t(self.dtype)),
         }
+
+    @property
+    def backing(self):
+        """The :class:`warp.Reservation` this array is a view over, or ``None`` for an ordinary allocation."""
+        return self._backing
+
+    def _byte_span(self, rows=None):
+        """The addressed bytes of this array (or of its first ``rows`` rows) as offsets from ``ptr``: ``(first, last + 1)``."""
+        shape = self.shape if rows is None else (rows, *self.shape[1:])
+        if any(s == 0 for s in shape):
+            return 0, 0
+        lo = 0
+        hi = 0
+        for s, st in zip(shape, self.strides, strict=True):
+            step = (s - 1) * int(st)
+            if step < 0:
+                lo += step
+            else:
+                hi += step
+        return lo, hi + type_size_in_bytes(self.dtype)
+
+    def _is_mapped(self, rows=None):
+        """Whether every byte this array addresses (or its first ``rows`` rows address) is mapped; always true without a backing."""
+        if self._backing is None:
+            return True
+        lo, hi = self._byte_span(rows)
+        return self._backing.covers_bytes(self.ptr + lo, hi - lo)
+
+    def _raise_unmapped(self, operation, end_offset, stream=None):
+        """Raise for a whole-array operation over unmapped rows, invalidating an open capture on the stream it would run on."""
+        backing = self._backing
+        message = (
+            f"{operation} over a partially mapped array: {backing.mapped_bytes} of {backing.size_bytes} bytes of its "
+            f"reservation are mapped and the operation addresses bytes up to {self.ptr + end_offset - backing.address}; "
+            f"bound it with an extent inside the mapped rows or map_prefix first"
+        )
+        if self.device is not None and self.device.is_cuda:
+            for candidate in (stream, self.device.stream):
+                if candidate is None:
+                    continue
+                graph = warp._src.context._capture_for_stream(candidate)
+                if graph is not None:
+                    warp._src.context.capture_invalidate(graph, message)
+                    break
+        raise RuntimeError(message)
+
+    def _require_mapped(self, operation, rows=None, stream=None):
+        """Raise, and invalidate an open capture, when a whole-array operation would touch unmapped rows."""
+        if self._is_mapped(rows):
+            return
+        _lo, hi = self._byte_span(rows)
+        self._raise_unmapped(operation, hi, stream)
 
     def mark_init(self):
         """Reset this array's read flag."""
@@ -4403,6 +4493,8 @@ class array(Array[DType, NDim]):
 
     def zero_(self, *, extent=None):
         """Zero array entries, or an explicit leading prefix as in :meth:`fill_`."""
+        if extent is None and self._backing is not None:
+            self._require_mapped("zero_")
         if extent is not None or warp._src.context._capture_memory_graph(self.device) is not None:
             self.fill_(0, extent=extent)
             return
@@ -4450,6 +4542,10 @@ class array(Array[DType, NDim]):
         """
         memory_graph = warp._src.context._capture_memory_graph(self.device)
         value_parameter = value if isinstance(value, CountParameter) else None
+        if extent is None and self._backing is not None:
+            # A fill without an extent writes the whole array; a count extent is bounded by the owner's
+            # readiness at replay, and an int extent is checked against the mapped prefix below.
+            self._require_mapped("fill_")
         if extent is not None or value_parameter is not None:
             from warp._src import capture_memory  # noqa: PLC0415
 
@@ -4458,6 +4554,8 @@ class array(Array[DType, NDim]):
                 dynamic = isinstance(declared[0], CountParameter) or value_parameter is not None
                 if dynamic and memory_graph is None:
                     raise RuntimeError("Count memory operands require recorded CUDA memory operations")
+                if self._backing is not None and not isinstance(declared[0], CountParameter):
+                    self._require_mapped("fill_", rows=declared[0])
                 if value_parameter is not None:
                     if self.dtype is not int32 or value_parameter.maximum >= 2**31:
                         raise TypeError("A count fill value requires an int32 array and int32 upper bound")
@@ -4595,6 +4693,9 @@ class array(Array[DType, NDim]):
         If the array is on the GPU, a synchronous device-to-host copy (on the CUDA default stream) will be
         automatically performed to ensure that any outstanding work is completed.
         """
+        if self._backing is not None:
+            self._require_mapped("numpy")
+
         # Determine if this array contains bfloat16 data (scalar or compound type)
         is_bf16 = self.dtype is bfloat16 or (
             isinstance(self.dtype, type)
@@ -4740,6 +4841,7 @@ class array(Array[DType, NDim]):
 
         # store back-ref to stop data being destroyed
         a._ref = self
+        a._backing = self._backing
         return a
 
     def reshape(self, shape):
@@ -4806,6 +4908,7 @@ class array(Array[DType, NDim]):
 
         # store back-ref to stop data being destroyed
         a._ref = self
+        a._backing = self._backing
         return a
 
     def view(self, dtype):
@@ -4916,6 +5019,7 @@ class array(Array[DType, NDim]):
         a._is_read = self._is_read
 
         a._ref = self
+        a._backing = self._backing
         return a
 
     def contiguous(self):
@@ -4923,6 +5027,8 @@ class array(Array[DType, NDim]):
         if self.is_contiguous:
             return self
 
+        if self._backing is not None:
+            self._require_mapped("contiguous")
         a = warp.empty_like(self)
         warp.copy(a, self)
         return a
@@ -4972,6 +5078,7 @@ class array(Array[DType, NDim]):
         a._is_read = self._is_read
 
         a._ref = self
+        a._backing = self._backing
         return a
 
     def ipc_handle(self) -> bytes:
@@ -5239,8 +5346,19 @@ class noncontiguous_array_base(Array[DType, NDim]):
         self.type_id = array_type_id
         self.is_contiguous = False
 
+    def _require_mapped(self, operation, rows=None, stream=None):
+        """An indexed view over an array placed on a Reservation is refused unless that array is fully mapped.
+
+        Index values live on the device, so no tighter host-side check is possible; index a slice of the
+        mapped rows instead.
+        """
+        data = getattr(self, "data", None)
+        if data is not None and getattr(data, "_backing", None) is not None:
+            data._require_mapped(operation, stream=stream)
+
     # return a contiguous copy
     def contiguous(self):
+        self._require_mapped("contiguous")
         a = warp.empty_like(self)
         warp.copy(a, self)
         return a
@@ -5278,6 +5396,8 @@ class noncontiguous_array_base(Array[DType, NDim]):
     def fill_(self, value):
         if self.size == 0:
             return
+
+        self._require_mapped("fill_")
 
         memory_graph = warp._src.context._capture_memory_graph(self.device)
         if memory_graph is not None:
@@ -5377,6 +5497,8 @@ class indexedarray(noncontiguous_array_base[DType, NDim]):
                 dtype = float32
 
         self.data = data
+        # a view over an array placed on a Reservation keeps the backing so the guards apply
+        self._backing = getattr(data, "_backing", None)
         self.indices = [None] * ARRAY_MAX_DIMS
 
         if data is not None:

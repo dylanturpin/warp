@@ -9790,6 +9790,10 @@ def zeros(
     Returns:
         A warp.array object representing the allocation
     """
+    if kwargs.get("virtual"):
+        raise ValueError(
+            "virtual=True is only supported by wp.empty; map rows with backing.map_prefix and fill them with an extent"
+        )
 
     arr = empty(
         shape=shape,
@@ -9855,6 +9859,10 @@ def ones(
     Returns:
         A warp.array object representing the allocation
     """
+    if kwargs.get("virtual"):
+        raise ValueError(
+            "virtual=True is only supported by wp.empty; map rows with backing.map_prefix and fill them with an extent"
+        )
 
     return full(
         shape=shape,
@@ -9915,6 +9923,10 @@ def full(
     Returns:
         A warp.array object representing the allocation
     """
+    if kwargs.get("virtual"):
+        raise ValueError(
+            "virtual=True is only supported by wp.empty; map rows with backing.map_prefix and fill them with an extent"
+        )
 
     if dtype is None:
         # determine dtype from value
@@ -10015,6 +10027,8 @@ def clone(
     Returns:
         A warp.array object representing the allocation
     """
+    if getattr(src, "_backing", None) is not None:
+        src._require_mapped("clone")  # before allocating a capacity-sized destination
 
     arr = empty_like(src, device=device, requires_grad=requires_grad, pinned=pinned, retain_grad=retain_grad)
 
@@ -10054,6 +10068,25 @@ def empty(
     # ensure shape is specified, even if creating a zero-sized array
     if shape is None:
         shape = 0
+
+    # virtual=True: one array at capacity over its own Reservation, unmapped (see warp.Reservation)
+    virtual = kwargs.pop("virtual", False)
+    budget = kwargs.pop("budget", None)
+    if virtual:
+        from warp._src.reservation import empty_virtual  # noqa: PLC0415
+
+        return empty_virtual(
+            shape,
+            dtype,
+            device,
+            budget=budget,
+            requires_grad=requires_grad,
+            pinned=pinned,
+            retain_grad=retain_grad,
+            **kwargs,
+        )
+    if budget is not None:
+        raise ValueError("budget= applies only together with virtual=True")
 
     arr = warp.array(
         shape=shape,
@@ -14875,6 +14908,50 @@ def _copy_caller_location() -> tuple[str, int] | tuple[None, None]:
     return frame.f_code.co_filename, frame.f_lineno
 
 
+def _require_copy_mapped(dest, src, dest_offset, src_offset, count, extent, stream):
+    """Refuse a copy that would address unmapped rows of an array over a Reservation, eagerly and under capture alike.
+
+    A count extent is bounded by the owner's readiness at replay and is not checked here; an int extent
+    is checked over its rows; otherwise the elements the copy addresses are checked (``count`` of them,
+    or all of ``src``). Malformed arguments are left to the copy's own validation.
+    """
+    if extent is not None:
+        rows = extent[0] if isinstance(extent, tuple) and extent else None
+        if type(rows) is int:
+            for a in (dest, src):
+                if getattr(a, "_backing", None) is not None and rows <= a.shape[0]:
+                    a._require_mapped("copy", rows=rows, stream=stream)
+        return
+    try:
+        dest_offset, src_offset, count = operator.index(dest_offset), operator.index(src_offset), operator.index(count)
+    except TypeError:
+        return
+    if dest_offset < 0 or src_offset < 0 or count < 0:
+        return
+    n = count or src.size
+    if n <= 0 or src_offset + n > src.size or dest_offset + n > dest.size:
+        return
+    for a, offset in ((dest, dest_offset), (src, src_offset)):
+        backing = getattr(a, "_backing", None)
+        if backing is None:
+            continue
+        if not isinstance(a, warp._src.types.array):
+            a._require_mapped("copy", stream=stream)  # an indexed view: its data array must be fully mapped
+            continue
+        itemsize = warp._src.types.type_size_in_bytes(a.dtype)
+        if a.is_contiguous:
+            lo, hi = offset * itemsize, (offset + n) * itemsize
+        elif a.ndim == 1:
+            step = int(a.strides[0])
+            first, last = offset * step, (offset + n - 1) * step
+            lo, hi = min(first, last), max(first, last) + itemsize
+        else:
+            a._require_mapped("copy", stream=stream)
+            continue
+        if not backing.covers_bytes(a.ptr + lo, hi - lo):
+            a._raise_unmapped("copy", hi, stream)
+
+
 def copy(
     dest: warp.array,
     src: warp.array,
@@ -14917,6 +14994,9 @@ def copy(
 
     if not warp._src.types.is_array(src) or not warp._src.types.is_array(dest):
         raise RuntimeError("Copy source and destination must be arrays")
+
+    if getattr(dest, "_backing", None) is not None or getattr(src, "_backing", None) is not None:
+        _require_copy_mapped(dest, src, dest_offset, src_offset, count, extent, stream)
 
     operation_device = stream.device if stream is not None else (dest.device if dest.device.is_cuda else src.device)
     memory_graph = _capture_memory_graph(operation_device, stream)
