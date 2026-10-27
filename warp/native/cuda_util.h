@@ -122,6 +122,15 @@ CUresult cuGraphAddNode_f(
 );
 #endif
 CUresult cuGraphNodeGetDependentNodes_f(CUgraphNode hNode, CUgraphNode* dependentNodes, size_t* numDependentNodes);
+CUresult cuGraphKernelNodeGetParams_f(CUgraphNode hNode, CUDA_KERNEL_NODE_PARAMS* nodeParams);
+CUresult cuGraphKernelNodeSetParams_f(CUgraphNode hNode, const CUDA_KERNEL_NODE_PARAMS* nodeParams);
+CUresult cuGraphKernelNodeGetAttribute_f(CUgraphNode hNode, CUkernelNodeAttrID attr, CUkernelNodeAttrValue* value_out);
+CUresult
+cuGraphKernelNodeSetAttribute_f(CUgraphNode hNode, CUkernelNodeAttrID attr, const CUkernelNodeAttrValue* value);
+#if CUDA_VERSION >= 12040
+// function used to locate kernel parameters for device-updatable graph nodes, not available in older CUDA versions
+CUresult cuFuncGetParamInfo_f(CUfunction func, size_t paramIndex, size_t* paramOffset, size_t* paramSize);
+#endif
 CUresult cuGraphNodeGetType_f(CUgraphNode hNode, CUgraphNodeType* type);
 CUresult cuModuleUnload_f(CUmodule hmod);
 CUresult cuModuleLoadDataEx_f(

@@ -58,6 +58,60 @@ def deterministic_scatter(source: wp.array[float], indices: wp.array[int], desti
     wp.atomic_add(destination, indices[index], source[index])
 
 
+@wp.kernel
+def write_index(values: wp.array[int], n: int):
+    i = wp.tid()
+    values[i] = i + 1 + n * 100
+
+
+@wp.kernel
+def write_scaled(source: wp.array[float], destination: wp.array[float], n: int):
+    i = wp.tid()
+    destination[i] = source[i] * float(n) + 0.5
+
+
+@wp.kernel
+def write_grid(values: wp.array2d[int], n: int):
+    i, j = wp.tid()
+    values[i, j] = n
+
+
+@wp.kernel(grid_stride=False, module="unique")
+def write_lean(values: wp.array[int], n: int):
+    i = wp.tid()
+    values[i] = n + 1
+
+
+@wp.kernel
+def read_reset(reset_counts: wp.array[int], reset_index: wp.array[int], contact_count: wp.array[int]):
+    contact_count[0] = reset_counts[reset_index[0]]
+
+
+@wp.kernel
+def narrowphase(count: int, contacts: wp.array[int], touched: wp.array[int]):
+    i = wp.tid()
+    contacts[i] = count * 1000 + i
+    touched[i] = touched[i] + 1
+
+
+@wp.kernel
+def write_pair(values: wp.array[int], first: int, second: int):
+    values[wp.tid()] = first * 10 + second
+
+
+@wp.kernel
+def latch_errors(errors: wp.array[int], latch: wp.array[int]):
+    i = wp.tid()
+    if errors[i] != 0:
+        latch[0] = 1
+
+
+@wp.kernel
+def write_volume(values: wp.array3d[int], n: int):
+    i, j, k = wp.tid()
+    values[i, j, k] = n
+
+
 def test_capture_packets(test, device):
     with wp.ScopedDevice(device):
         values = wp.zeros(8, dtype=int)
@@ -712,6 +766,594 @@ def test_count_parameter_rejects_unrecorded_and_wrong_scalar(test, device):
                 wp.capture_launch(capture.graph)
 
 
+def _count_update_supported(test):
+    if not wp.is_conditional_graph_supported():
+        test.skipTest("Count updates require CUDA 12.4+")
+
+
+def test_count_update_replay_zero_to_positive(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        values = wp.zeros(8, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([count], [source])
+            wp.launch(write_index, count, [values, count])
+        graph = capture.graph
+        records = wp.capture_get_launches(graph)
+        test.assertEqual(len(records), 1)
+        test.assertEqual(wp.capture_get_count_bound_launches(graph), records)
+        test.assertEqual(wp.capture_launch_count(graph), 1)
+        with test.assertRaises(ValueError):
+            wp.capture_complete_preparation(graph, count)  # Warp discharged it
+        test.assertIsNone(graph.graph_exec)
+        other_stream = wp.Stream(device)
+        exec_handle = None
+        # The first replay reads zero, so the node is disabled before it ever ran.
+        for live, stream in ((0, None), (4, None), (0, other_stream), (8, other_stream), (1, None)):
+            values.zero_()
+            source.fill_(live)
+            wp.synchronize_device(device)
+            wp.capture_launch(graph, stream=stream)
+            wp.synchronize_device(device)
+            if exec_handle is None:
+                exec_handle = graph.graph_exec.value
+            test.assertEqual(graph.graph_exec.value, exec_handle)
+            expected = np.zeros(8, dtype=np.int32)
+            expected[:live] = np.arange(1, live + 1) + live * 100
+            np.testing.assert_array_equal(values.numpy(), expected)
+            np.testing.assert_array_equal(wp.capture_get_count_update_errors(graph).numpy(), [0])
+
+
+def test_count_update_matches_eager(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        inputs = wp.array(np.arange(8, dtype=np.float32) + 1.0)
+        replayed = wp.full(8, -1.0, dtype=float)
+        eager = wp.full(8, -1.0, dtype=float)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([count], [source])
+            wp.launch(write_scaled, count, [inputs, replayed, count])
+        for live in (3, 0, 8, 5):
+            replayed.fill_(-1.0)
+            eager.fill_(-1.0)
+            source.fill_(live)
+            wp.capture_launch(capture.graph)
+            wp.launch(write_scaled, live, [inputs, eager, live])
+            np.testing.assert_array_equal(replayed.numpy(), eager.numpy())
+
+
+def test_count_update_scalar_only_runs_at_zero(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        values = wp.full(4, -1, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([count], [source])
+            wp.launch(write_index, 4, [values, count])
+        for live in (0, 5, 8):
+            source.fill_(live)
+            wp.capture_launch(capture.graph)
+            np.testing.assert_array_equal(values.numpy(), np.arange(1, 5) + live * 100)
+        # The same count in two scalar arguments after an array argument binds both offsets.
+        pair = wp.zeros(4, dtype=int)
+        with wp.ScopedCapture(record_launches=True) as pair_capture:
+            wp.capture_update_counts([count], [source])
+            wp.launch(write_pair, 4, [pair, count, count])
+        record = wp.capture_get_count_bound_launches(pair_capture.graph)[0]
+        test.assertEqual([index for index, _ in record.scalar_parameters], [2, 3])
+        for live in (3, 0, 8):
+            source.fill_(live)
+            wp.capture_launch(pair_capture.graph)
+            np.testing.assert_array_equal(pair.numpy(), live * 11)
+
+
+def test_count_update_two_axes_and_lean_grid(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        rows, cols = wp.CountParameter(4), wp.CountParameter(6)
+        row_source, col_source = wp.zeros(1, dtype=wp.int32), wp.zeros(1, dtype=wp.int32)
+        grid = wp.zeros((4, 6), dtype=int)
+        # A lean kernel large enough that its grid spills past 2^24 threads into gridDim.y.
+        lean_capacity = (1 << 24) + 300000
+        lean_count = wp.CountParameter(lean_capacity)
+        lean_source = wp.zeros(1, dtype=wp.int32)
+        lean = wp.zeros(lean_capacity, dtype=int)
+        wp.load_module(device=device)
+        wp.load_module(module=write_lean.module, device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([rows, cols, lean_count], [row_source, col_source, lean_source])
+            wp.launch(write_grid, (rows, cols), [grid, cols])
+            wp.launch(write_lean, lean_count, [lean, 5])
+        test.assertEqual(len(wp.capture_get_count_bound_launches(capture.graph)), 2)
+        for live_rows, live_cols, live_lean in (
+            (2, 3, 1000),
+            (0, 4, 1 << 24),
+            (4, 6, (1 << 24) + 1),
+            (1, 1, lean_capacity),
+            (3, 0, 65536 * 256 + 1),
+        ):
+            grid.zero_()
+            lean.zero_()
+            row_source.fill_(live_rows)
+            col_source.fill_(live_cols)
+            lean_source.fill_(live_lean)
+            wp.capture_launch(capture.graph)
+            expected = np.zeros((4, 6), dtype=np.int32)
+            expected[:live_rows, :live_cols] = live_cols
+            np.testing.assert_array_equal(grid.numpy(), expected)
+            written = lean.numpy()
+            test.assertEqual(int(np.count_nonzero(written)), live_lean)
+            test.assertTrue(np.all(written[:live_lean] == 6))
+            np.testing.assert_array_equal(wp.capture_get_count_update_errors(capture.graph).numpy(), [0, 0])
+
+
+def test_count_update_out_of_range_disables_launch(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        values = wp.zeros(8, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([count], [source])
+            wp.launch(write_index, count, [values, count])
+        exec_handle = None
+        for live, expected_error in ((9, -1), (-1, -1), (2, 0), (2**31 - 1, -1), (8, 0)):
+            values.zero_()
+            source.fill_(live)
+            wp.capture_launch(capture.graph)
+            if exec_handle is None:
+                exec_handle = capture.graph.graph_exec.value
+            test.assertEqual(capture.graph.graph_exec.value, exec_handle)
+            np.testing.assert_array_equal(wp.capture_get_count_update_errors(capture.graph).numpy(), [expected_error])
+            expected = np.zeros(8, dtype=np.int32)
+            if expected_error == 0:
+                expected[:live] = np.arange(1, live + 1) + live * 100
+            np.testing.assert_array_equal(values.numpy(), expected)
+        # A scalar-only binding is disabled by an out-of-range value too, and recovers.
+        scalar_values = wp.full(4, -1, dtype=int)
+        with wp.ScopedCapture(record_launches=True) as scalar_capture:
+            wp.capture_update_counts([count], [source])
+            wp.launch(write_index, 4, [scalar_values, count])
+        for live, expected_error in ((9, -1), (3, 0)):
+            source.fill_(live)
+            wp.capture_launch(scalar_capture.graph)
+            np.testing.assert_array_equal(
+                wp.capture_get_count_update_errors(scalar_capture.graph).numpy(), [expected_error]
+            )
+            expected = np.full(4, -1, dtype=np.int32) if expected_error else np.arange(1, 5) + live * 100
+            np.testing.assert_array_equal(scalar_values.numpy(), expected)
+
+
+def test_count_update_leaves_unnamed_counts_pending(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        bound, pending = wp.CountParameter(8), wp.CountParameter(4)
+        source = wp.zeros(1, dtype=wp.int32)
+        first, second = wp.zeros(8, dtype=int), wp.zeros(4, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([bound], [source])
+            wp.launch(write_index, bound, [first, bound])
+            wp.launch(write_index, pending, [second, 7])
+        graph = capture.graph
+        test.assertEqual(len(wp.capture_get_count_bound_launches(graph)), 1)
+        with test.assertRaises(ValueError):
+            wp.capture_complete_preparation(graph, bound)  # Warp discharged the bound count
+        with test.assertRaisesRegex(RuntimeError, "preparation"):
+            wp.capture_launch(graph)
+        # An external binder keeps the pending count at its maximum here.
+        wp.capture_complete_preparation(graph, pending)
+        source.fill_(3)
+        wp.capture_launch(graph)
+        np.testing.assert_array_equal(first.numpy(), [301, 302, 303, 0, 0, 0, 0, 0])
+        np.testing.assert_array_equal(second.numpy(), np.arange(1, 5) + 700)
+
+        # A launch that mixes a bound count with one the update point does not name fails closed.
+        mixed = wp.zeros(8, dtype=int)
+        with test.assertRaisesRegex(RuntimeError, "does not name"):
+            with wp.ScopedCapture(record_launches=True) as capture:
+                active = device.captures[wp.get_stream(device)]
+                wp.capture_update_counts([bound], [source])
+                wp.launch(write_index, bound, [mixed, pending])
+        with test.assertRaisesRegex(RuntimeError, "invalid"):
+            wp.capture_launch(active)
+
+
+def test_count_update_requires_recording_and_order(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        values = wp.zeros(8, dtype=int)
+        wp.load_module(device=device)
+        with test.assertRaisesRegex(RuntimeError, "record_launches"):
+            wp.capture_update_counts([count], [source])
+        with wp.ScopedCapture() as capture:
+            with test.assertRaisesRegex(RuntimeError, "record_launches"):
+                wp.capture_update_counts([count], [source])
+        wp.capture_launch(capture.graph)
+        # An older toolkit or driver is refused before anything is recorded; the capture stays usable.
+        with wp.ScopedCapture(record_launches=True) as capture:
+            with mock.patch.object(context, "is_conditional_graph_supported", return_value=False):
+                with test.assertRaisesRegex(RuntimeError, "12.4"):
+                    wp.capture_update_counts([count], [source])
+            wp.launch(write_value, 1, [values, 5])
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(values.numpy()[0], 5)
+        for bad_counts, bad_sources in (
+            ([count], [wp.zeros(2, dtype=wp.int32)]),
+            ([count], [wp.zeros(1, dtype=wp.int64)]),
+            ([count, count], [source, source]),
+            ([8], [source]),
+            ([], []),
+        ):
+            with wp.ScopedCapture(record_launches=True) as capture:
+                with test.assertRaises(ValueError):
+                    wp.capture_update_counts(bad_counts, bad_sources)
+            wp.capture_launch(capture.graph)
+        # One update point per capture.
+        with wp.ScopedCapture(record_launches=True) as capture:
+            active = device.captures[wp.get_stream(device)]
+            wp.capture_update_counts([count], [source])
+            with test.assertRaisesRegex(RuntimeError, "one count update point"):
+                wp.capture_update_counts([count], [source])
+        with test.assertRaisesRegex(RuntimeError, "invalid"):
+            wp.capture_launch(active)
+        # A count launch recorded before the update point cannot be bound by it.
+        with test.assertRaisesRegex(RuntimeError, "precedes"):
+            with wp.ScopedCapture(record_launches=True) as capture:
+                active = device.captures[wp.get_stream(device)]
+                wp.launch(write_index, count, [values, count])
+                wp.capture_update_counts([count], [source])
+        with test.assertRaisesRegex(RuntimeError, "invalid"):
+            wp.capture_launch(active)
+        # Another capture open on the device at capture_end is refused, and the other capture survives.
+        side = wp.Stream(device)
+        wp.capture_begin(stream=side)
+        try:
+            with test.assertRaisesRegex(RuntimeError, "no other capture"):
+                with wp.ScopedCapture(record_launches=True) as capture:
+                    active = device.captures[wp.get_stream(device)]
+                    wp.capture_update_counts([count], [source])
+                    wp.launch(write_index, count, [values, count])
+            with test.assertRaisesRegex(RuntimeError, "invalid"):
+                wp.capture_launch(active)
+            wp.launch(write_value, 1, [values, 9], stream=side)
+        finally:
+            side_graph = wp.capture_end(stream=side)
+        wp.capture_launch(side_graph)
+        wp.synchronize_device(device)
+        test.assertEqual(values.numpy()[0], 9)
+        # The stream is free again: a fresh recorded capture on it binds and replays.
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([count], [source])
+            wp.launch(write_index, count, [values, count])
+        bound_graph = capture.graph
+        source.fill_(2)
+        wp.capture_launch(bound_graph)
+        np.testing.assert_array_equal(values.numpy()[:2], [201, 202])
+        # A count-bound graph cannot be inserted into another capture: child insertion clones nodes.
+        condition = wp.ones(1, dtype=int)
+        for insert in (
+            lambda: wp.capture_launch(bound_graph),
+            lambda: wp.capture_if(condition, bound_graph),
+        ):
+            with wp.ScopedCapture() as outer:
+                with test.assertRaisesRegex(RuntimeError, "cannot be inserted"):
+                    insert()
+            with test.assertRaises(RuntimeError):
+                wp.capture_launch(outer.graph)
+        wp.capture_launch(bound_graph)
+
+
+def test_count_update_joined_stream(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        values = wp.zeros(8, dtype=int)
+        main_stream = wp.get_stream(device)
+        side = wp.Stream(device)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([count], [source])
+            side.wait_stream(main_stream)
+            wp.launch(write_index, count, [values, count], stream=side)
+            main_stream.wait_stream(side)
+        test.assertEqual(len(wp.capture_get_count_bound_launches(capture.graph)), 1)
+        for live in (5, 0, 8):
+            values.zero_()
+            source.fill_(live)
+            wp.capture_launch(capture.graph)
+            expected = np.zeros(8, dtype=np.int32)
+            expected[:live] = np.arange(1, live + 1) + live * 100
+            np.testing.assert_array_equal(values.numpy(), expected)
+
+
+def test_count_update_inside_conditional_bodies(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        outer, inner = wp.ones(1, dtype=int), wp.ones(1, dtype=int)
+        values, nested = wp.zeros(8, dtype=int), wp.zeros(8, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([count], [source])
+            wp.capture_if(
+                outer,
+                lambda: (
+                    wp.launch(write_index, count, [values, count]),
+                    wp.capture_if(inner, lambda: wp.launch(write_index, count, [nested, count])),
+                ),
+            )
+        graph = capture.graph
+        test.assertEqual(len(wp.capture_get_count_bound_launches(graph)), 2)
+        test.assertTrue(all(r.graph_handle != graph.graph.value for r in wp.capture_get_launches(graph)))
+        for live, outer_on, inner_on in ((4, 1, 1), (0, 1, 1), (8, 1, 0), (3, 0, 1), (6, 1, 1)):
+            values.zero_()
+            nested.zero_()
+            source.fill_(live)
+            outer.fill_(outer_on)
+            inner.fill_(inner_on)
+            wp.capture_launch(graph)
+            expected = np.zeros(8, dtype=np.int32)
+            expected[:live] = np.arange(1, live + 1) + live * 100
+            np.testing.assert_array_equal(values.numpy(), expected if outer_on else np.zeros(8, dtype=np.int32))
+            np.testing.assert_array_equal(
+                nested.numpy(), expected if outer_on and inner_on else np.zeros(8, dtype=np.int32)
+            )
+            np.testing.assert_array_equal(wp.capture_get_count_update_errors(graph).numpy(), [0, 0])
+        # A while body: the updater before the loop serves the launch inside it.
+        condition = wp.ones(1, dtype=int)
+        stopped = wp.zeros(1, dtype=int)
+        looped = wp.zeros(8, dtype=int)
+        with wp.ScopedCapture(record_launches=True) as while_capture:
+            wp.capture_update_counts([count], [source])
+            wp.capture_while(
+                condition,
+                lambda: (
+                    wp.launch(write_index, count, [looped, count]),
+                    wp.launch(stop_loop, 1, [condition, stopped]),
+                ),
+            )
+        for live in (3, 0, 8):
+            looped.zero_()
+            condition.fill_(1)
+            source.fill_(live)
+            wp.capture_launch(while_capture.graph)
+            expected = np.zeros(8, dtype=np.int32)
+            expected[:live] = np.arange(1, live + 1) + live * 100
+            np.testing.assert_array_equal(looped.numpy(), expected)
+            test.assertEqual(stopped.numpy()[0], 17)
+        # An update point inside a body is refused: it would not run on replays that skip the body,
+        # whether it serves a launch outside the body or inside it.
+        for body in (
+            lambda: wp.capture_update_counts([count], [source]),
+            lambda: (wp.capture_update_counts([count], [source]), wp.launch(write_index, count, [values, count])),
+        ):
+            with test.assertRaisesRegex(RuntimeError, "root graph"):
+                with wp.ScopedCapture(record_launches=True) as capture:
+                    active = device.captures[wp.get_stream(device)]
+                    wp.capture_if(outer, body)
+                    wp.launch(write_index, count, [values, count])
+            with test.assertRaisesRegex(RuntimeError, "invalid"):
+                wp.capture_launch(active)
+
+
+def test_count_update_newton_shaped_contacts(test, device):
+    # One graph per solver step: a device kernel publishes the live contact count of the
+    # current reset, the update point reads it, the narrowphase runs over exactly that many
+    # contacts, and a fixed launch stays fixed. Resets change the count with no re-capture.
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        capacity = 16
+        n_contacts = wp.CountParameter(capacity)
+        population_counts = wp.zeros(3, dtype=wp.int32)
+        contact_count = population_counts[1:2]  # a view into the population's live counts, as Newton binds them
+        reset_counts = wp.array([0, 5, 2, 16, 7, 20], dtype=int)  # the last reset exceeds the capacity
+        reset_index = wp.zeros(1, dtype=int)
+        step_condition = wp.ones(1, dtype=int)
+        errors = wp.zeros(2, dtype=wp.int32)
+        healthy = wp.zeros(1, dtype=int)
+        contacts = wp.full(capacity, -1, dtype=int)
+        touched = wp.zeros(capacity, dtype=int)
+        fixed = wp.zeros(4, dtype=int)
+        eager_contacts = wp.full(capacity, -1, dtype=int)
+        eager_touched = wp.zeros(capacity, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.launch(read_reset, 1, [reset_counts, reset_index, contact_count])
+            wp.capture_update_counts([n_contacts], [contact_count], errors=errors)
+            wp.capture_if(step_condition, lambda: wp.launch(narrowphase, n_contacts, [n_contacts, contacts, touched]))
+            wp.launch(write_index, 4, [fixed, 2])
+            wp.launch(latch_errors, 2, [errors, healthy])
+        graph = capture.graph
+        test.assertEqual(len(wp.capture_get_count_bound_launches(graph)), 1)
+        with test.assertRaises(ValueError):
+            wp.capture_complete_preparation(graph, n_contacts)
+        exec_handle = None
+        for reset, live in enumerate(reset_counts.numpy().tolist()):
+            reset_index.fill_(reset)
+            healthy.zero_()
+            wp.capture_launch(graph)
+            if live <= capacity:
+                wp.launch(narrowphase, live, [live, eager_contacts, eager_touched])
+            if exec_handle is None:
+                exec_handle = graph.graph_exec.value
+            test.assertEqual(graph.graph_exec.value, exec_handle)
+            test.assertEqual(contact_count.numpy()[0], live)
+            np.testing.assert_array_equal(contacts.numpy(), eager_contacts.numpy())
+            np.testing.assert_array_equal(touched.numpy(), eager_touched.numpy())
+            np.testing.assert_array_equal(fixed.numpy(), np.arange(1, 5) + 200)
+            np.testing.assert_array_equal(errors.numpy(), [0 if live <= capacity else -1, 0])
+            test.assertEqual(healthy.numpy()[0], 0 if live <= capacity else 1)
+        test.assertEqual(int(touched.numpy().sum()), 30)
+
+
+def test_count_update_shared_sources_and_repeated_counts(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        first, second, unused = wp.CountParameter(8), wp.CountParameter(8), wp.CountParameter(8)
+        shared = wp.zeros(1, dtype=wp.int32)
+        other = wp.zeros(1, dtype=wp.int32)
+        shared_ref = weakref.ref(shared)
+        # A non-owning view writes the live value after the owning name is gone.
+        shared_view = wp.array(ptr=shared.ptr, dtype=wp.int32, shape=(1,), device=device)
+        a, b, c = wp.zeros(8, dtype=int), wp.zeros(8, dtype=int), wp.zeros(8, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            # one count in two launches, one source serving two counts, equal maxima kept apart,
+            # and a named count that no launch uses
+            wp.capture_update_counts([first, second, unused], [shared, other, other])
+            wp.launch(write_index, first, [a, 1])
+            wp.launch(write_index, first, [b, 2])
+            wp.launch(write_index, second, [c, 3])
+        graph = capture.graph
+        test.assertEqual(len(wp.capture_get_count_bound_launches(graph)), 3)
+        test.assertEqual(wp.capture_get_count_update_errors(graph).shape, (3,))
+        with wp.ScopedCapture(record_launches=True) as empty_capture:
+            wp.capture_update_counts([unused], [other])
+            wp.launch(write_value, 1, [a, 1])
+        test.assertEqual(wp.capture_get_count_bound_launches(empty_capture.graph), ())
+        test.assertEqual(wp.capture_get_count_update_errors(empty_capture.graph).shape, (0,))
+        wp.capture_launch(empty_capture.graph)
+        # Two graphs may bind one source; the second outlives the first.
+        d = wp.zeros(8, dtype=int)
+        with wp.ScopedCapture(record_launches=True) as second_capture:
+            wp.capture_update_counts([second], [other])
+            wp.launch(write_index, second, [d, 4])
+        del shared
+        gc.collect()
+        test.assertIsNotNone(shared_ref())  # the Graph retains the source
+        for live_first, live_second in ((3, 5), (0, 8), (8, 0)):
+            a.zero_()
+            b.zero_()
+            c.zero_()
+            shared_view.fill_(live_first)
+            other.fill_(live_second)
+            wp.capture_launch(graph)
+            np.testing.assert_array_equal(a.numpy()[:live_first], np.arange(1, live_first + 1) + 100)
+            np.testing.assert_array_equal(a.numpy()[live_first:], 0)
+            np.testing.assert_array_equal(b.numpy()[:live_first], np.arange(1, live_first + 1) + 200)
+            np.testing.assert_array_equal(b.numpy()[live_first:], 0)
+            np.testing.assert_array_equal(c.numpy()[:live_second], np.arange(1, live_second + 1) + 300)
+            np.testing.assert_array_equal(c.numpy()[live_second:], 0)
+        del graph, capture
+        gc.collect()
+        test.assertIsNone(shared_ref())  # and releases it with the Graph
+        other.fill_(6)
+        wp.capture_launch(second_capture.graph)
+        np.testing.assert_array_equal(d.numpy(), [401, 402, 403, 404, 405, 406, 0, 0])
+
+
+def test_count_update_in_graph_guard(test, device):
+    # Newton's shape: a kernel recorded after the bound launches reads the error words and
+    # latches the batch unhealthy, so the words must exist during the capture.
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        errors = wp.full(4, 7, dtype=wp.int32)
+        latch = wp.zeros(1, dtype=int)
+        values = wp.zeros(8, dtype=int)
+        wp.load_module(device=device)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([count], [source], errors=errors)
+            wp.launch(write_index, count, [values, count])
+            wp.launch(latch_errors, 4, [errors, latch])
+        graph = capture.graph
+        test.assertIs(wp.capture_get_count_update_errors(graph), errors)
+        np.testing.assert_array_equal(errors.numpy(), [0, 7, 7, 7])  # only the bound prefix is cleared
+        errors[1:].zero_()
+        for live, expected_latch in ((3, 0), (9, 1), (0, 0), (8, 0)):
+            latch.zero_()
+            source.fill_(live)
+            wp.capture_launch(graph)
+            test.assertEqual(latch.numpy()[0], expected_latch)
+            np.testing.assert_array_equal(errors.numpy(), [-1 if expected_latch else 0, 0, 0, 0])
+        # Too small an errors array fails closed at capture_end.
+        with test.assertRaisesRegex(RuntimeError, "entries"):
+            with wp.ScopedCapture(record_launches=True) as capture:
+                active = device.captures[wp.get_stream(device)]
+                wp.capture_update_counts([count], [source], errors=wp.zeros(1, dtype=wp.int32))
+                wp.launch(write_index, count, [values, count])
+                wp.launch(write_index, count, [values, count])
+        with test.assertRaisesRegex(RuntimeError, "invalid"):
+            wp.capture_launch(active)
+
+
+def test_count_update_tiled_rank3_and_grid_caps(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        rows, depth, big = wp.CountParameter(5), wp.CountParameter(4), wp.CountParameter(4096)
+        row_source, depth_source, big_source = (wp.zeros(1, dtype=wp.int32) for _ in range(3))
+        tile_source = wp.array(np.arange(20, dtype=np.float32))
+        tile_target = wp.full(20, -1.0, dtype=float)
+        volume = wp.zeros((4, 2, 3), dtype=int)
+        capped = wp.zeros(4096, dtype=int)
+        eager = wp.zeros(4096, dtype=int)
+        wp.load_module(device=device)
+        wp.launch_tiled(copy_tile, dim=1, inputs=[tile_source, tile_target], block_dim=32)
+        with wp.ScopedCapture(record_launches=True) as capture:
+            wp.capture_update_counts([rows, depth, big], [row_source, depth_source, big_source])
+            wp.launch_tiled(copy_tile, dim=rows, inputs=[tile_source, tile_target], block_dim=32)
+            wp.launch(write_volume, (depth, 2, 3), [volume, depth])
+            wp.launch(write_index, big, [capped, 0], max_blocks=4)
+        records = wp.capture_get_count_bound_launches(capture.graph)
+        test.assertEqual(len(records), 3)
+        bounds = type(launch_bounds_t((0,))).from_buffer_copy(records[0].parameter_bytes[0])
+        test.assertEqual(bounds.coord_mult, 32)
+        test.assertEqual(records[2].max_blocks, 4)
+        for live_rows, live_depth, live_big in ((3, 2, 1000), (0, 4, 4096), (5, 0, 1), (1, 1, 0)):
+            tile_target.fill_(-1.0)
+            volume.zero_()
+            capped.zero_()
+            eager.zero_()
+            row_source.fill_(live_rows)
+            depth_source.fill_(live_depth)
+            big_source.fill_(live_big)
+            wp.capture_launch(capture.graph)
+            wp.launch(write_index, live_big, [eager, 0], max_blocks=4)
+            np.testing.assert_array_equal(tile_target.numpy()[: live_rows * 4], tile_source.numpy()[: live_rows * 4])
+            np.testing.assert_array_equal(tile_target.numpy()[live_rows * 4 :], -1.0)
+            expected = np.zeros((4, 2, 3), dtype=np.int32)
+            expected[:live_depth] = live_depth
+            np.testing.assert_array_equal(volume.numpy(), expected)
+            np.testing.assert_array_equal(capped.numpy(), eager.numpy())
+            np.testing.assert_array_equal(wp.capture_get_count_update_errors(capture.graph).numpy(), [0, 0, 0])
+
+
+def test_count_update_rejects_launch_forked_before_update_point(test, device):
+    _count_update_supported(test)
+    with wp.ScopedDevice(device):
+        count = wp.CountParameter(8)
+        source = wp.zeros(1, dtype=wp.int32)
+        values = wp.zeros(8, dtype=int)
+        main_stream = wp.get_stream(device)
+        side = wp.Stream(device)
+        wp.load_module(device=device)
+        with test.assertRaisesRegex(RuntimeError, "does not depend"):
+            with wp.ScopedCapture(record_launches=True) as capture:
+                active = device.captures[main_stream]
+                wp.launch(write_value, 1, [values, 1])
+                side.wait_stream(main_stream)
+                wp.capture_update_counts([count], [source])
+                wp.launch(write_index, count, [values, count], stream=side)
+                main_stream.wait_stream(side)
+        with test.assertRaisesRegex(RuntimeError, "invalid"):
+            wp.capture_launch(active)
+
+
 class TestCountParameters(unittest.TestCase):
     def test_identity_and_host_protocol(self):
         value, other = wp.CountParameter(8), wp.CountParameter(8)
@@ -848,6 +1490,20 @@ for test_func in (
     test_count_parameter_occurrences_and_obligations,
     test_count_parameter_tiled_and_prefix_memory,
     test_count_parameter_rejects_unrecorded_and_wrong_scalar,
+    test_count_update_replay_zero_to_positive,
+    test_count_update_matches_eager,
+    test_count_update_scalar_only_runs_at_zero,
+    test_count_update_two_axes_and_lean_grid,
+    test_count_update_out_of_range_disables_launch,
+    test_count_update_leaves_unnamed_counts_pending,
+    test_count_update_requires_recording_and_order,
+    test_count_update_joined_stream,
+    test_count_update_inside_conditional_bodies,
+    test_count_update_newton_shaped_contacts,
+    test_count_update_shared_sources_and_repeated_counts,
+    test_count_update_in_graph_guard,
+    test_count_update_tiled_rank3_and_grid_caps,
+    test_count_update_rejects_launch_forked_before_update_point,
 ):
     add_function_test(TestCaptureLaunches, test_func.__name__, test_func, devices=get_selected_cuda_test_devices())
 

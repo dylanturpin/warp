@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <iterator>
 #include <list>
 #include <map>
@@ -168,6 +169,9 @@ struct ContextInfo {
 
     // conditional graph node support, loaded on demand if the driver supports it (CUDA 12.4+)
     CUmodule conditional_module = NULL;
+
+    // count update kernel for device-updatable graph nodes, loaded on demand (CUDA 12.4+)
+    CUmodule count_update_module = NULL;
 };
 
 // Extra resources tied to a graph, freed after the graph is released by CUDA.
@@ -2871,6 +2875,8 @@ void wp_cuda_context_destroy(void* context)
 
             if (info->conditional_module)
                 check_cu(cuModuleUnload_f(info->conditional_module));
+            if (info->count_update_module)
+                check_cu(cuModuleUnload_f(info->count_update_module));
 
             g_contexts.erase(ctx);
         }
@@ -4546,8 +4552,495 @@ bool wp_cuda_graph_set_condition(void* context, void* stream, int arch, bool use
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// Count binding for recorded launches: device-updatable kernel nodes whose
+// launch bounds, grid and int32 scalar arguments follow live device counts.
+// The updater kernel runs as an ordinary node ahead of the launches it updates.
+// ---------------------------------------------------------------------------
+
+// Shared between the host (binding preparation) and the NVRTC-compiled updater
+// kernel source below; both see the same field list through WP_COUNT_BINDING_FIELDS.
+#define WP_COUNT_BINDING_FIELDS                                                                                     \
+    unsigned long long node;              /* cudaGraphDeviceNode_t of the bound kernel node */                      \
+    unsigned long long axis_source[4];    /* device int32 pointer per launch axis, 0 when the axis is fixed */      \
+    unsigned long long scalar_source[4];  /* device int32 pointer per bound scalar argument */                      \
+    unsigned long long coord_mult;        /* launch_bounds_t coordinate multiplier as captured */                   \
+    unsigned int scalar_offset[4];        /* byte offset of each bound scalar in the parameter buffer */            \
+    int scalar_maximum[4];                /* upper bound of each bound scalar */                                    \
+    int axis_maximum[4];                  /* captured launch shape, which is also each axis's upper bound */        \
+    int rank;                             /* compiled launch rank, 1 to 4 */                                        \
+    int scalar_count;                     /* bound scalars, 0 to 4 */                                               \
+    int block_dim;                        /* captured blockDim.x */                                                 \
+    int max_blocks;                       /* grid-stride block cap, 0 for none */                                   \
+    int grid_stride;                      /* 1 grid-stride loop kernel, 0 lean 3D kernel */                         \
+    int axis_bound;                       /* 1 when at least one axis follows a source */                           \
+    unsigned int bounds_offset;           /* byte offset of launch_bounds_t in the parameter buffer */              \
+    unsigned int bounds_size;             /* sizeof launch_bounds_t for this rank */                                \
+    unsigned int grid_limit_x;            /* captured grid, the envelope the live grid never exceeds */             \
+    unsigned int grid_limit_y;                                                                                      \
+    unsigned int grid_limit_z;
+
+struct CountBinding {
+    WP_COUNT_BINDING_FIELDS
+};
+
+#define WP_STRINGIFY_IMPL(x) #x
+#define WP_STRINGIFY(x) WP_STRINGIFY_IMPL(x)
+
+static const int WP_COUNT_UPDATE_BLOCK = 128;
+
+// CUBIN or PTX data for the compiled count update module, keyed on device architecture.
+// Guarded by g_count_update_mutex together with ContextInfo::count_update_module, because
+// ctypes releases the GIL around native calls and two threads may bind at once.
+static std::map<ModuleKey, void*> g_count_update_modules;
+static std::mutex g_count_update_mutex;
+
+static void* compile_count_update_module(int arch, bool use_ptx)
+{
+    // The device graph update entry points are driver builtins, resolved at module load like
+    // cudaGraphSetConditional above; NVRTC needs only extern "C" declarations and no link step.
+    static const std::string kernel_source = std::string(R"(
+        typedef struct CUgraphDeviceUpdatableNode_st* cudaGraphDeviceNode_t;
+        extern "C" __device__ __cudart_builtin__ cudaError_t cudaGraphKernelNodeSetParam(cudaGraphDeviceNode_t node, size_t offset, const void* value, size_t size);
+        extern "C" __device__ __cudart_builtin__ cudaError_t cudaGraphKernelNodeSetGridDim(cudaGraphDeviceNode_t node, dim3 gridDim);
+        extern "C" __device__ __cudart_builtin__ cudaError_t cudaGraphKernelNodeSetEnabled(cudaGraphDeviceNode_t node, bool enable);
+
+        struct CountBinding { )")
+        + WP_STRINGIFY(WP_COUNT_BINDING_FIELDS) + R"( };
+
+        extern "C" __global__ void wp_count_update_kernel(const CountBinding* bindings, int count, int* errors)
+        {
+            int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i >= count)
+                return;
+            const CountBinding& b = bindings[i];
+            cudaGraphDeviceNode_t node = (cudaGraphDeviceNode_t)b.node;
+
+            int shape[4];
+            int scalars[4];
+            bool valid = true;
+            bool empty = false;
+            for (int r = 0; r < b.rank; ++r) {
+                int value = b.axis_maximum[r];
+                if (b.axis_source[r]) {
+                    value = *(const int*)b.axis_source[r];
+                    if (value < 0 || value > b.axis_maximum[r])
+                        valid = false;
+                    if (value == 0)
+                        empty = true;
+                }
+                shape[r] = value;
+            }
+            for (int s = 0; s < b.scalar_count; ++s) {
+                int value = *(const int*)b.scalar_source[s];
+                if (value < 0 || value > b.scalar_maximum[s])
+                    valid = false;
+                scalars[s] = value;
+            }
+
+            // An out-of-range count or an empty launch axis disables the node for this replay.
+            if (!valid || empty) {
+                cudaError_t err = cudaGraphKernelNodeSetEnabled(node, false);
+                errors[i] = valid ? (int)err : -1;
+                return;
+            }
+
+            cudaError_t err = cudaSuccess;
+            if (b.axis_bound) {
+                // Rebuild launch_bounds_t: int32 shape[rank], then size_t size and coord_mult at an 8-byte
+                // boundary. Built in 64-bit words so every store is naturally aligned.
+                unsigned long long words[4] = {0ull, 0ull, 0ull, 0ull};
+                unsigned int* entries = (unsigned int*)words;
+                unsigned long long size = 1;
+                for (int r = 0; r < b.rank; ++r) {
+                    entries[r] = (unsigned int)shape[r];
+                    size *= (unsigned long long)shape[r];
+                }
+                size *= b.coord_mult;
+                unsigned int size_word = (b.rank * 4 + 7) / 8;
+                words[size_word] = size;
+                words[size_word + 1] = b.coord_mult;
+                err = cudaGraphKernelNodeSetParam(node, b.bounds_offset, words, b.bounds_size);
+
+                // The grid follows wp_cuda_launch_kernel(): a 1D grid for grid-stride kernels, a 3D spill otherwise.
+                unsigned long long blocks = (size + (unsigned long long)b.block_dim - 1) / (unsigned long long)b.block_dim;
+                unsigned int gx, gy = 1, gz = 1;
+                if (b.grid_stride) {
+                    unsigned long long cap = b.max_blocks > 0 ? (unsigned long long)b.max_blocks : 2147483647ull;
+                    gx = (unsigned int)(blocks < cap ? blocks : cap);
+                    if (gx == 0)
+                        gx = 1;
+                } else {
+                    unsigned int max_grid_x = (1u << 24) / (unsigned int)b.block_dim;
+                    gx = (unsigned int)(blocks < (unsigned long long)max_grid_x ? blocks : (unsigned long long)max_grid_x);
+                    if (gx == 0)
+                        gx = 1;
+                    unsigned long long remaining = (blocks + gx - 1) / gx;
+                    gy = (unsigned int)(remaining < 65535ull ? remaining : 65535ull);
+                    if (gy == 0)
+                        gy = 1;
+                    unsigned long long rest = (remaining + gy - 1) / gy;
+                    gz = (unsigned int)(rest < 65535ull ? rest : 65535ull);
+                    if (gz == 0)
+                        gz = 1;
+                }
+                // Never exceed the captured envelope; the live count is at most the maximum.
+                if (gx > b.grid_limit_x) gx = b.grid_limit_x;
+                if (gy > b.grid_limit_y) gy = b.grid_limit_y;
+                if (gz > b.grid_limit_z) gz = b.grid_limit_z;
+                if (err == cudaSuccess)
+                    err = cudaGraphKernelNodeSetGridDim(node, dim3(gx, gy, gz));
+            }
+            for (int s = 0; s < b.scalar_count && err == cudaSuccess; ++s)
+                err = cudaGraphKernelNodeSetParam(node, b.scalar_offset[s], &scalars[s], 4);
+            if (err == cudaSuccess)
+                err = cudaGraphKernelNodeSetEnabled(node, true);
+            else
+                cudaGraphKernelNodeSetEnabled(node, false);
+            errors[i] = (int)err;
+        }
+    )";
+
+    ModuleKey key = { arch, use_ptx };
+    auto it = g_count_update_modules.find(key);
+    if (it != g_count_update_modules.end())
+        return it->second;
+
+    nvrtcProgram prog;
+    if (!check_nvrtc(nvrtcCreateProgram(&prog, kernel_source.c_str(), "count_update_kernels", 0, NULL, NULL)))
+        return NULL;
+
+    char arch_opt[128];
+    if (use_ptx)
+        snprintf(arch_opt, sizeof(arch_opt), "--gpu-architecture=compute_%d", arch);
+    else
+        snprintf(arch_opt, sizeof(arch_opt), "--gpu-architecture=sm_%d", arch);
+
+    std::vector<const char*> opts;
+    opts.push_back(arch_opt);
+
+    if (!check_nvrtc(nvrtcCompileProgram(prog, int(opts.size()), opts.data()))) {
+        size_t log_size;
+        if (check_nvrtc(nvrtcGetProgramLogSize(prog, &log_size))) {
+            std::vector<char> log(log_size);
+            if (check_nvrtc(nvrtcGetProgramLog(prog, log.data())))
+                fprintf(stderr, "%s", log.data());
+        }
+        nvrtcDestroyProgram(&prog);
+        return NULL;
+    }
+
+    char* output = NULL;
+    size_t output_size = 0;
+    bool fetched = false;
+    if (use_ptx) {
+        if (check_nvrtc(nvrtcGetPTXSize(prog, &output_size)) && output_size > 0) {
+            output = new char[output_size];
+            fetched = check_nvrtc(nvrtcGetPTX(prog, output));
+        }
+    } else {
+        if (check_nvrtc(nvrtcGetCUBINSize(prog, &output_size)) && output_size > 0) {
+            output = new char[output_size];
+            fetched = check_nvrtc(nvrtcGetCUBIN(prog, output));
+        }
+    }
+    nvrtcDestroyProgram(&prog);
+    if (!fetched) {
+        delete[] output;
+        return NULL;
+    }
+    g_count_update_modules[key] = output;
+    return output;
+}
+
+static CUfunction get_count_update_kernel(void* context, int arch, bool use_ptx)
+{
+    ContextInfo* context_info = get_context_info(context);
+    if (!context_info)
+        return NULL;
+
+    std::lock_guard<std::mutex> lock(g_count_update_mutex);
+    if (!context_info->count_update_module) {
+        void* compiled_module = compile_count_update_module(arch, use_ptx);
+        if (!compiled_module) {
+            wp::set_error_string("Warp error: Failed to compile the count update kernel");
+            return NULL;
+        }
+        CUmodule module = NULL;
+        if (!check_cu(cuModuleLoadDataEx_f(&module, compiled_module, 0, NULL, NULL))) {
+            wp::set_error_string("Warp error: Failed to load the count update kernel module");
+            return NULL;
+        }
+        context_info->count_update_module = module;
+    }
+
+    CUfunction kernel;
+    if (!check_cu(cuModuleGetFunction_f(&kernel, context_info->count_update_module, "wp_count_update_kernel"))) {
+        wp::set_error_string("Warp error: Failed to get the count update kernel");
+        return NULL;
+    }
+    return kernel;
+}
+
+static unsigned int count_update_grid(int count)
+{
+    int blocks = (count + WP_COUNT_UPDATE_BLOCK - 1) / WP_COUNT_UPDATE_BLOCK;
+    return (unsigned int)(blocks > 0 ? blocks : 1);
+}
+
+int wp_cuda_count_binding_size() { return int(sizeof(CountBinding)); }
+
+bool wp_cuda_count_updater_launch(
+    void* context, void* stream, int arch, bool use_ptx, void* bindings, int count, void* errors
+)
+{
+    ContextGuard guard(context);
+
+    CUfunction kernel = get_count_update_kernel(context, arch, use_ptx);
+    if (!kernel)
+        return false;
+
+    void* kernel_args[3];
+    kernel_args[0] = &bindings;
+    kernel_args[1] = &count;
+    kernel_args[2] = &errors;
+
+    if (!check_cu(cuLaunchKernel_f(
+            kernel, count_update_grid(count), 1, 1, WP_COUNT_UPDATE_BLOCK, 1, 1, 0, static_cast<CUstream>(stream),
+            kernel_args, NULL
+        )))
+        return false;
+
+    return true;
+}
+
+bool wp_cuda_count_updater_bind(void* node, void* bindings, int count, void* errors)
+{
+    // Point the recorded updater node at its table, which is allocated after capture because
+    // nothing may be allocated during capture; grid and arguments are replaced together.
+    CUDA_KERNEL_NODE_PARAMS params = {};
+    if (!check_cu(cuGraphKernelNodeGetParams_f(static_cast<CUgraphNode>(node), &params)))
+        return false;
+    void* kernel_args[3];
+    kernel_args[0] = &bindings;
+    kernel_args[1] = &count;
+    kernel_args[2] = &errors;
+    params.kernelParams = kernel_args;
+    params.extra = NULL;
+    params.gridDimX = count_update_grid(count);
+    params.gridDimY = 1;
+    params.gridDimZ = 1;
+    if (!check_cu(cuGraphKernelNodeSetParams_f(static_cast<CUgraphNode>(node), &params)))
+        return false;
+    return true;
+}
+
+bool wp_cuda_count_binding_prepare(
+    void* node_handle,
+    int rank,
+    const void* const* axis_sources,
+    const int* scalar_indices,
+    const void* const* scalar_sources,
+    const int* scalar_maxima,
+    int scalar_count,
+    int grid_stride,
+    int max_blocks,
+    const void* expected_bounds,
+    int expected_bounds_size,
+    void* out_binding,
+    void** func_out
+)
+{
+    if (rank < 1 || rank > 4 || scalar_count < 0 || scalar_count > 4 || !node_handle || !out_binding) {
+        wp::set_error_string("Warp error: count binding needs a kernel node, a rank of 1 to 4 and at most 4 scalars");
+        return false;
+    }
+    if (scalar_count > 0 && (!scalar_indices || !scalar_sources || !scalar_maxima)) {
+        wp::set_error_string("Warp error: count binding needs index, source and bound arrays for its scalars");
+        return false;
+    }
+
+    CUgraphNode node = static_cast<CUgraphNode>(node_handle);
+    CUDA_KERNEL_NODE_PARAMS params = {};
+    if (!check_cu(cuGraphKernelNodeGetParams_f(node, &params)))
+        return false;
+    if (!params.func || !params.kernelParams || !params.kernelParams[0]) {
+        wp::set_error_string("Warp error: count binding needs a kernel node launched with a parameter buffer");
+        return false;
+    }
+    if (params.blockDimX == 0 || params.blockDimY != 1 || params.blockDimZ != 1 || params.gridDimX == 0
+        || params.gridDimY == 0 || params.gridDimZ == 0) {
+        wp::set_error_string("Warp error: count binding needs a one-dimensional block");
+        return false;
+    }
+
+    if (func_out)
+        *func_out = params.func;
+
+    // A live grid is never cluster aligned, so a kernel with cluster requirements cannot have a
+    // bound axis. Recorded launches already refuse clustered kernels; this guards the node itself.
+    bool axis_bound = false;
+    for (int r = 0; r < rank; ++r)
+        axis_bound = axis_bound || (axis_sources && axis_sources[r]);
+    if (axis_bound) {
+        CUkernelNodeAttrValue cluster = {};
+        if (!check_cu(cuGraphKernelNodeGetAttribute_f(node, CU_KERNEL_NODE_ATTRIBUTE_CLUSTER_DIMENSION, &cluster)))
+            return false;
+        bool clustered = cluster.clusterDim.x > 1 || cluster.clusterDim.y > 1 || cluster.clusterDim.z > 1;
+        const CUfunction_attribute required[] = {
+            CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET,
+            CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH,
+            CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT,
+            CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH,
+        };
+        for (CUfunction_attribute attribute : required) {
+            int value = 0;
+            if (!check_cu(cuFuncGetAttribute_f(&value, attribute, params.func)))
+                return false;
+            clustered = clustered || value != 0;
+        }
+        if (clustered) {
+            wp::set_error_string("Warp error: count binding cannot resize the grid of a clustered kernel");
+            return false;
+        }
+    }
+
+    CountBinding binding = {};
+    size_t bounds_offset = 0, bounds_size = 0;
+    if (!check_cu(cuFuncGetParamInfo_f(params.func, 0, &bounds_offset, &bounds_size)))
+        return false;
+    size_t size_offset = ((size_t(rank) * 4 + 7) / 8) * 8;
+    if (bounds_size != size_offset + 2 * sizeof(size_t) || bounds_size > 32) {
+        wp::set_error_string("Warp error: count binding found an unexpected launch bounds layout");
+        return false;
+    }
+    if (expected_bounds && expected_bounds_size >= 0) {
+        if (size_t(expected_bounds_size) != bounds_size
+            || std::memcmp(expected_bounds, params.kernelParams[0], bounds_size) != 0) {
+            wp::set_error_string("Warp error: count binding found launch bounds that differ from the launch record");
+            return false;
+        }
+    }
+    const unsigned char* bounds = static_cast<const unsigned char*>(params.kernelParams[0]);
+    unsigned long long expected_work = 1;
+    for (int r = 0; r < rank; ++r) {
+        int width = 0;
+        std::memcpy(&width, bounds + r * 4, 4);
+        if (width <= 0) {
+            wp::set_error_string("Warp error: count binding needs positive captured launch extents");
+            return false;
+        }
+        binding.axis_maximum[r] = width;
+        expected_work *= (unsigned long long)width;
+    }
+    unsigned long long work = 0, coord_mult = 0;
+    std::memcpy(&work, bounds + size_offset, 8);
+    std::memcpy(&coord_mult, bounds + size_offset + 8, 8);
+    if (coord_mult == 0 || work != expected_work * coord_mult) {
+        wp::set_error_string("Warp error: count binding found inconsistent launch bounds");
+        return false;
+    }
+
+    binding.rank = rank;
+    binding.coord_mult = coord_mult;
+    binding.bounds_offset = (unsigned int)bounds_offset;
+    binding.bounds_size = (unsigned int)bounds_size;
+    binding.block_dim = int(params.blockDimX);
+    binding.max_blocks = max_blocks;
+    binding.grid_stride = grid_stride ? 1 : 0;
+    binding.grid_limit_x = params.gridDimX;
+    binding.grid_limit_y = params.gridDimY;
+    binding.grid_limit_z = params.gridDimZ;
+    binding.axis_bound = 0;
+    for (int r = 0; r < rank; ++r) {
+        binding.axis_source[r] = axis_sources ? (unsigned long long)(uintptr_t)axis_sources[r] : 0;
+        if (binding.axis_source[r])
+            binding.axis_bound = 1;
+    }
+
+    binding.scalar_count = scalar_count;
+    for (int s = 0; s < scalar_count; ++s) {
+        if (scalar_indices[s] <= 0 || !scalar_sources[s] || scalar_maxima[s] < 0) {
+            wp::set_error_string(
+                "Warp error: count binding needs a positive packet index, a source and a bound per scalar"
+            );
+            return false;
+        }
+        for (int t = 0; t < s; ++t) {
+            if (scalar_indices[t] == scalar_indices[s]) {
+                wp::set_error_string("Warp error: count binding names one scalar argument twice");
+                return false;
+            }
+        }
+        size_t offset = 0, size = 0;
+        if (!check_cu(cuFuncGetParamInfo_f(params.func, size_t(scalar_indices[s]), &offset, &size)))
+            return false;
+        if (size != 4) {
+            wp::set_error_string("Warp error: count binding needs int32 scalar arguments");
+            return false;
+        }
+        binding.scalar_offset[s] = (unsigned int)offset;
+        binding.scalar_source[s] = (unsigned long long)(uintptr_t)scalar_sources[s];
+        binding.scalar_maximum[s] = scalar_maxima[s];
+    }
+
+    // Mark the node device-updatable and fetch the handle the updater kernel writes through.
+    CUkernelNodeAttrValue attr = {};
+    attr.deviceUpdatableKernelNode.deviceUpdatable = 1;
+    if (!check_cu(cuGraphKernelNodeSetAttribute_f(node, CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, &attr)))
+        return false;
+    attr = {};
+    if (!check_cu(cuGraphKernelNodeGetAttribute_f(node, CU_KERNEL_NODE_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, &attr)))
+        return false;
+    if (!attr.deviceUpdatableKernelNode.devNode) {
+        wp::set_error_string("Warp error: the driver returned no device-updatable handle for the kernel node");
+        return false;
+    }
+    binding.node = (unsigned long long)(uintptr_t)attr.deviceUpdatableKernelNode.devNode;
+
+    std::memcpy(out_binding, &binding, sizeof(binding));
+    return true;
+}
+
 #else
 // stubs for conditional graph node API if CUDA toolkit is too old.
+
+int wp_cuda_count_binding_size() { return 0; }
+
+bool wp_cuda_count_updater_launch(
+    void* context, void* stream, int arch, bool use_ptx, void* bindings, int count, void* errors
+)
+{
+    wp::set_error_string("Warp error: Warp must be built with CUDA Toolkit 12.4+ to bind counts in graphs");
+    return false;
+}
+
+bool wp_cuda_count_updater_bind(void* node, void* bindings, int count, void* errors)
+{
+    wp::set_error_string("Warp error: Warp must be built with CUDA Toolkit 12.4+ to bind counts in graphs");
+    return false;
+}
+
+bool wp_cuda_count_binding_prepare(
+    void* node_handle,
+    int rank,
+    const void* const* axis_sources,
+    const int* scalar_indices,
+    const void* const* scalar_sources,
+    const int* scalar_maxima,
+    int scalar_count,
+    int grid_stride,
+    int max_blocks,
+    const void* expected_bounds,
+    int expected_bounds_size,
+    void* out_binding,
+    void** func_out
+)
+{
+    wp::set_error_string("Warp error: Warp must be built with CUDA Toolkit 12.4+ to bind counts in graphs");
+    return false;
+}
 
 bool wp_cuda_graph_pause_capture(void* context, void* stream, void** graph_ret)
 {

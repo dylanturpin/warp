@@ -6069,6 +6069,27 @@ class CapturedConditionalBody:
     body_graph_handle: int
 
 
+class CountUpdate:
+    """The count update point of one recorded capture, owned by its Graph.
+
+    Records the updater kernel node, the counts it serves and their device
+    sources at the call site, then the device table, the per-launch error
+    words and the bound records once :func:`capture_end` has bound them.
+    Everything here lives as long as the Graph.
+    """
+
+    def __init__(self, node_handle: int, graph_handle: int, record_index: int, counts, sources):
+        self.node_handle = node_handle
+        self.graph_handle = graph_handle
+        self.record_index = record_index
+        self.counts = tuple(counts)
+        self.sources = tuple(sources)
+        self.table = None
+        self.errors = None
+        self.user_errors = None
+        self.bound_launches: tuple[CapturedLaunch, ...] = ()
+
+
 class Graph:
     """A handle to a captured graph of Warp operations.
 
@@ -6096,6 +6117,8 @@ class Graph:
         self._launch_recording_incomplete = False
         self._capture_error: str | None = None
         self._preparation_owners: list[Any] = []
+        self._count_update: CountUpdate | None = None
+        self._external = False
         self.module_execs: set[ModuleExec] = set()
         self._deterministic_buffer_refs: list[Any] = []
         self.graph_exec: ctypes.c_void_p | None = None
@@ -7760,6 +7783,41 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_void_p),
             ]
             self.core.wp_cuda_capture_get_kernel_node.restype = ctypes.c_bool
+            self.core.wp_cuda_count_binding_size.argtypes = []
+            self.core.wp_cuda_count_binding_size.restype = ctypes.c_int
+            self.core.wp_cuda_count_updater_launch.argtypes = [
+                ctypes.c_void_p,  # context
+                ctypes.c_void_p,  # stream
+                ctypes.c_int,  # arch
+                ctypes.c_bool,  # use_ptx
+                ctypes.c_void_p,  # bindings
+                ctypes.c_int,  # count
+                ctypes.c_void_p,  # errors
+            ]
+            self.core.wp_cuda_count_updater_launch.restype = ctypes.c_bool
+            self.core.wp_cuda_count_updater_bind.argtypes = [
+                ctypes.c_void_p,  # node
+                ctypes.c_void_p,  # bindings
+                ctypes.c_int,  # count
+                ctypes.c_void_p,  # errors
+            ]
+            self.core.wp_cuda_count_updater_bind.restype = ctypes.c_bool
+            self.core.wp_cuda_count_binding_prepare.argtypes = [
+                ctypes.c_void_p,  # node
+                ctypes.c_int,  # rank
+                ctypes.POINTER(ctypes.c_void_p),  # axis sources
+                ctypes.POINTER(ctypes.c_int),  # scalar packet indices
+                ctypes.POINTER(ctypes.c_void_p),  # scalar sources
+                ctypes.POINTER(ctypes.c_int),  # scalar maxima
+                ctypes.c_int,  # scalar count
+                ctypes.c_int,  # grid_stride
+                ctypes.c_int,  # max_blocks
+                ctypes.c_char_p,  # expected bounds bytes
+                ctypes.c_int,  # expected bounds size
+                ctypes.c_void_p,  # out binding
+                ctypes.POINTER(ctypes.c_void_p),  # out function
+            ]
+            self.core.wp_cuda_count_binding_prepare.restype = ctypes.c_bool
             self.core.wp_cuda_stream_get_priority.argtypes = [ctypes.c_void_p]
             self.core.wp_cuda_stream_get_priority.restype = ctypes.c_int
 
@@ -13082,10 +13140,348 @@ def _validate_capture_insertion(graph, parent):
         _validate_capture(graph, prepared=True)
         if parent is not None and parent._record_launches:
             raise RuntimeError("Recorded capture cannot insert prebuilt graphs; use callable bodies")
+        if parent is not None and graph._count_update is not None:
+            # Child graph insertion clones the nodes; the device-updatable handles belong to the original.
+            raise RuntimeError("A graph with a count update point cannot be inserted into another capture")
     except Exception as error:
         if parent is not None:
             capture_invalidate(parent, str(error))
         raise
+
+
+def capture_update_counts(
+    counts: Sequence[CountParameter],
+    sources: Sequence[warp.array],
+    *,
+    errors: warp.array | None = None,
+    stream: Stream | None = None,
+) -> None:
+    """Bind count parameters to device sources inside the current recorded capture.
+
+    Records Warp's count update node at the call site. Every recorded launch
+    that comes after it in this capture and uses one of ``counts`` as a launch
+    dimension or as an int32 scalar argument is bound by :func:`capture_end`:
+    its kernel node becomes device-updatable and, on every replay, the update
+    node reads each source and rewrites that launch's bounds, grid and scalar
+    arguments before the launch runs. The graph is instantiated once, lazily,
+    at the first :func:`capture_launch`. Counts that this call does not name
+    stay pending for an external binder through
+    :func:`capture_require_preparation` and :func:`capture_complete_preparation`;
+    a launch may not mix named and unnamed counts. A named count that no later
+    launch uses is accepted. Launches without counts are never touched.
+
+    Each source is one contiguous CUDA int32 array of shape ``(1,)`` on the
+    capture device, allocated outside the capture (a slice view such as
+    ``live[p : p + 1]`` is fine), holding the count's live value at replay; the
+    Graph retains it. A live value must satisfy ``0 <= value <= count.maximum``.
+    A launch whose bound dimension reads zero is disabled for that replay; a
+    launch bound only through scalars still runs and sees zero. An out-of-range
+    value disables the launch and sets its error word.
+
+    Error words: one int32 per bound launch, in the order of
+    :func:`capture_get_count_bound_launches`, rewritten on every replay: 0 when
+    the launch was updated (or disabled by a zero dimension), -1 when a source
+    was out of range, otherwise the CUDA error of the device update. Pass
+    ``errors``, an int32 CUDA array allocated outside the capture with at least
+    one entry per bound launch, when a kernel recorded in this capture should
+    read the words (:func:`capture_end` clears the first entries, one per bound
+    launch, and never touches the rest); otherwise :func:`capture_end`
+    allocates exactly one word per bound launch. Either way
+    :func:`capture_get_count_update_errors` returns the array.
+
+    Legal once per capture, while a CUDA capture with ``record_launches=True``
+    that Warp will end itself is active on ``stream`` (the device's current
+    stream by default), in the root graph, before the launches it binds. The
+    update node is not a launch record. Nothing is allocated during capture;
+    :func:`capture_end` allocates the table and therefore requires that no other
+    capture is open on the device at that moment. Requires CUDA Toolkit and
+    driver 12.4 or newer.
+
+    Args:
+        counts: The :class:`CountParameter` identities to bind.
+        sources: One int32 device array of shape ``(1,)`` per count.
+        errors: Optional int32 device array that receives the error words.
+        stream: The capturing CUDA stream (the device's current stream if ``None``).
+
+    Raises:
+        RuntimeError: If no recorded capture is active on the stream, the capture
+          is external, the capture already has an update point, or the toolkit
+          or driver is older than 12.4.
+        ValueError: If a count, a source or ``errors`` is not of the required kind.
+    """
+    if not is_conditional_graph_supported():
+        raise RuntimeError("Count updates require Warp built with CUDA Toolkit 12.4+ and a CUDA 12.4+ driver")
+    if stream is None:
+        device = runtime.get_device(None)
+        if not device.is_cuda:
+            raise RuntimeError("Count updates require a CUDA device")
+        stream = device.stream
+    else:
+        device = stream.device
+
+    graph = _capture_for_stream(stream) if device.is_cuda else None
+    if graph is None or not graph._record_launches:
+        raise RuntimeError("Count updates require an active CUDA capture with record_launches=True on the stream")
+    _validate_capture(graph)
+    if graph._external:
+        raise RuntimeError("Count updates require a capture that Warp ends and instantiates, not an external capture")
+    if graph._count_update is not None:
+        capture_invalidate(graph, "A capture takes one count update point")
+        raise RuntimeError("A capture takes one count update point")
+
+    counts = tuple(counts)
+    sources = tuple(sources)
+    if not counts or len(counts) != len(sources):
+        raise ValueError("Count updates need one source per count and at least one count")
+    for index, count in enumerate(counts):
+        if not isinstance(count, CountParameter):
+            raise ValueError("Count updates bind CountParameter identities")
+        if any(count is other for other in counts[:index]):
+            raise ValueError("Count updates name each CountParameter once")
+    for source in sources:
+        if (
+            not isinstance(source, warp.array)
+            or source.dtype is not warp.int32
+            or source.shape != (1,)
+            or not source.is_contiguous
+            or not source.ptr
+            or source.device != device
+        ):
+            raise ValueError("Count sources must be contiguous int32 CUDA arrays of shape (1,) on the capture device")
+    if errors is not None and (
+        not isinstance(errors, warp.array)
+        or errors.dtype is not warp.int32
+        or errors.ndim != 1
+        or errors.shape[0] < 1
+        or not errors.is_contiguous
+        or not errors.ptr
+        or errors.device != device
+    ):
+        raise ValueError(
+            "Count update errors must be a contiguous one-dimensional int32 CUDA array on the capture device"
+        )
+
+    if graph._launch_recording_incomplete:
+        capture_invalidate(graph, "Count update point overlapped an incomplete operation")
+        raise RuntimeError("Graph contains an incomplete recorded launch")
+    graph._launch_recording_incomplete = True
+    try:
+        # The updater is recorded with an empty table; capture_end sizes the table to the
+        # bound launches and points this node at it, so nothing is allocated under capture.
+        # The update module is a CUBIN for the device's own architecture whenever NVRTC knows
+        # it, so a driver older than the toolkit never has to JIT newer PTX; PTX for the device
+        # architecture is the fallback only when NVRTC predates the GPU (then the driver is newer).
+        if not runtime.core.wp_cuda_count_updater_launch(
+            device.context,
+            stream.cuda_stream,
+            device.arch,
+            not device.is_cubin_supported,
+            None,
+            0,
+            None,
+        ):
+            raise RuntimeError(runtime.get_error_string())
+        native_graph, node = ctypes.c_void_p(), ctypes.c_void_p()
+        if not runtime.core.wp_cuda_capture_get_kernel_node(
+            stream.cuda_stream, ctypes.byref(native_graph), ctypes.byref(node)
+        ):
+            raise RuntimeError(runtime.get_error_string())
+        # Inside a conditional body the update node would run only when the body runs, leaving
+        # the bound launches and the error words stale on replays that skip it.
+        if any(body.body_graph_handle == native_graph.value for body in graph._captured_conditional_bodies):
+            raise RuntimeError(
+                "The count update point must be recorded in the root graph, not inside a conditional body"
+            )
+    except Exception as error:
+        capture_invalidate(graph, f"Count update point failed: {error}")
+        raise
+    update = CountUpdate(node.value, native_graph.value, len(graph._captured_launches), counts, sources)
+    update.user_errors = errors
+    graph._count_update = update
+    graph._launch_recording_incomplete = False
+
+
+def capture_get_count_update_errors(graph: Graph) -> warp.array:
+    """Return the device int32 error words of the graph's count-bound launches.
+
+    One word per launch bound by :func:`capture_update_counts`, in the order of
+    :func:`capture_get_count_bound_launches`, rewritten by the update node on
+    every replay: 0 when the launch was updated or disabled by a zero dimension,
+    -1 when a source was outside ``[0, maximum]`` and the launch was disabled,
+    otherwise the CUDA error of the device update. The array is the one passed
+    as ``errors`` to :func:`capture_update_counts`, else one that
+    :func:`capture_end` allocated; reading it on the host synchronizes.
+
+    Raises:
+        RuntimeError: If the graph has no update point or capture has not ended.
+    """
+    _validate_capture(graph)
+    update = graph._count_update
+    if update is None or update.errors is None:
+        raise RuntimeError("Graph has no bound count update point")
+    return update.errors
+
+
+def capture_get_count_bound_launches(graph: Graph) -> tuple[CapturedLaunch, ...]:
+    """Return the launch records bound by the graph's count update point, in record order."""
+    _validate_capture(graph)
+    update = graph._count_update
+    if update is None:
+        return ()
+    return update.bound_launches
+
+
+# NodeDependencyResult in warp/native/cuda_util.h
+_NODE_DEPENDENCY_DEPENDENT = 0  # the argument node depends on the referent node
+_NODE_DEPENDENCY_ERROR = -1  # the query failed
+
+
+def _count_update_ancestor_in(graph, record_graph_handle, update_graph_handle):
+    """Return the node in the update point's graph that contains ``record_graph_handle``.
+
+    A launch recorded inside conditional bodies is reached from the update
+    point's graph through the conditional node that owns its body; nested
+    bodies climb one containment record at a time.
+    """
+    node = None
+    handle = record_graph_handle
+    seen = set()
+    while handle != update_graph_handle:
+        if handle in seen:
+            return None
+        seen.add(handle)
+        body = next((b for b in graph._captured_conditional_bodies if b.body_graph_handle == handle), None)
+        if body is None:
+            return None
+        node = body.node_handle
+        handle = body.graph_handle
+    return node
+
+
+def _bind_count_updates(graph: Graph, device: Device, stream: Stream) -> None:
+    """Bind every count-bearing launch recorded after the update point; called by capture_end."""
+    update = graph._count_update
+    # Inside a conditional body the update node runs only when the body runs, so the words and
+    # the bound launches would go stale on replays that skip it: the root graph is the only place.
+    if any(body.body_graph_handle == update.graph_handle for body in graph._captured_conditional_bodies):
+        raise RuntimeError("The count update point must be recorded in the root graph, not inside a conditional body")
+    # Binding allocates the table and synchronizes the stream, which another open capture on the
+    # device forbids (thread-local capture mode) or would be broken by; refuse before the first
+    # node is marked device-updatable, since that mark cannot be undone.
+    if device.captures:
+        raise RuntimeError(
+            "Count binding at capture_end needs no other capture active on the device; end or pause the other capture first"
+        )
+    source_of = {id(count): source for count, source in zip(update.counts, update.sources, strict=True)}
+    binding_size = runtime.core.wp_cuda_count_binding_size()
+    if binding_size <= 0:
+        raise RuntimeError("Count updates require Warp built with CUDA Toolkit 12.4+")
+
+    host = bytearray()
+    bound = []
+    for index, record in enumerate(graph._captured_launches):
+        axes = {axis: count for axis, count in record.extent_parameters if id(count) in source_of}
+        scalars = [(packet, count) for packet, count in record.scalar_parameters if id(count) in source_of]
+        if not axes and not scalars:
+            continue
+        unnamed = [
+            count for _, count in (*record.extent_parameters, *record.scalar_parameters) if id(count) not in source_of
+        ]
+        if unnamed:
+            raise RuntimeError(
+                f"Recorded launch of kernel '{record.kernel.key}' mixes counts bound by the update point with counts it does not name"
+            )
+        if index < update.record_index:
+            raise RuntimeError(f"Recorded launch of kernel '{record.kernel.key}' precedes the count update point")
+        # The update node must run before the launch on every replay: a direct or indirect
+        # dependency in the update point's graph, through the conditional node for a launch
+        # recorded inside a conditional body.
+        if record.graph_handle == update.graph_handle:
+            dependent = record.node_handle
+        else:
+            dependent = _count_update_ancestor_in(graph, record.graph_handle, update.graph_handle)
+            if dependent is None:
+                raise RuntimeError(
+                    f"Recorded launch of kernel '{record.kernel.key}' lies in a graph the count update point cannot reach"
+                )
+        dependency = runtime.core.wp_cuda_graph_node_depends_on(dependent, update.node_handle)
+        if dependency == _NODE_DEPENDENCY_ERROR:
+            raise RuntimeError(
+                f"Could not query the dependencies of the recorded launch of kernel '{record.kernel.key}': "
+                f"{runtime.get_error_string()}"
+            )
+        if dependency != _NODE_DEPENDENCY_DEPENDENT:
+            raise RuntimeError(
+                f"Recorded launch of kernel '{record.kernel.key}' does not depend on the count update point"
+            )
+
+        rank = len(record.dim)
+        if rank < 1 or rank > LAUNCH_MAX_DIMS:
+            raise RuntimeError(f"Recorded launch of kernel '{record.kernel.key}' has an unsupported rank {rank}")
+        if len(scalars) > 4:
+            raise RuntimeError(f"Recorded launch of kernel '{record.kernel.key}' binds more than four count scalars")
+        axis_sources = (ctypes.c_void_p * LAUNCH_MAX_DIMS)()
+        for axis, count in axes.items():
+            axis_sources[axis] = source_of[id(count)].ptr
+        scalar_indices = (ctypes.c_int * 4)(*(packet for packet, _ in scalars))
+        scalar_sources = (ctypes.c_void_p * 4)(*(source_of[id(count)].ptr for _, count in scalars))
+        scalar_maxima = (ctypes.c_int * 4)(*(count.maximum for _, count in scalars))
+        bounds = record.parameter_bytes[0]
+        out = ctypes.create_string_buffer(binding_size)
+        node_func = ctypes.c_void_p()
+        if not runtime.core.wp_cuda_count_binding_prepare(
+            record.node_handle,
+            rank,
+            axis_sources,
+            scalar_indices,
+            scalar_sources,
+            scalar_maxima,
+            len(scalars),
+            int(record.grid_stride),
+            record.max_blocks,
+            bounds,
+            len(bounds),
+            out,
+            ctypes.byref(node_func),
+        ):
+            raise RuntimeError(runtime.get_error_string())
+        # The update node can only rewrite nodes on its own device: the node's function must be
+        # this device's build of the record's kernel (a joined stream from another GPU records
+        # into the same graph).
+        module_exec = record.kernel.module.load(device, record.block_dim)
+        expected_func = module_exec._get_forward_cuda_kernel(record.kernel) if module_exec else None
+        if not expected_func or int(expected_func) != int(node_func.value or 0):
+            raise RuntimeError(f"Recorded launch of kernel '{record.kernel.key}' was not launched on device '{device}'")
+        host += out.raw
+        bound.append(record)
+
+    # The table and the error words are ordinary device arrays retained by the Graph; the
+    # update node is pointed at them now, before the graph is instantiated.
+    count = len(bound)
+    if update.user_errors is not None and update.user_errors.shape[0] < count:
+        raise RuntimeError(
+            f"Count update errors array holds {update.user_errors.shape[0]} entries but {count} launches are bound"
+        )
+    with warp.ScopedStream(stream, sync_enter=False):
+        table = warp.empty(max(count, 1) * binding_size, dtype=warp.uint8, device=device)
+        if update.user_errors is not None:
+            errors = update.user_errors
+            if count:
+                errors[:count].zero_()
+        else:
+            errors = warp.zeros(count, dtype=warp.int32, device=device)
+        if count:
+            table.assign(np.frombuffer(bytes(host), dtype=np.uint8))
+    # A plain stream synchronize: the Python helper refuses while any capture is registered.
+    runtime.core.wp_cuda_stream_synchronize(stream.cuda_stream)
+    if not runtime.core.wp_cuda_count_updater_bind(update.node_handle, table.ptr, count, errors.ptr or None):
+        raise RuntimeError(runtime.get_error_string())
+    update.table = table
+    update.errors = errors
+    update.bound_launches = tuple(bound)
+    for count_parameter in update.counts:
+        if any(count_parameter is owner for owner in graph._preparation_owners):
+            capture_complete_preparation(graph, count_parameter)
 
 
 def capture_begin(
@@ -13240,6 +13636,7 @@ def capture_begin(
     graph = Graph(device, capture_id)
     graph._record_launches = record_launches
     graph._record_memory_operations = record_memory_operations
+    graph._external = external
 
     # Attach APIC capture state if recording
     if apic_capture is not None:
@@ -13307,6 +13704,13 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
     # set the graph executable
     graph.graph = g
     graph.graph_exec = None  # Lazy initialization
+
+    if graph._count_update is not None:
+        try:
+            _bind_count_updates(graph, device, stream)
+        except Exception as error:
+            capture_invalidate(graph, f"Count binding failed: {error}")
+            raise
 
     return graph
 

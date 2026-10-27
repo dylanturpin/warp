@@ -107,6 +107,13 @@ static PFN_cuEventSynchronize_v2000 pfn_cuEventSynchronize;
 static PFN_cuGraphAddNode_v12030 pfn_cuGraphAddNode;
 #endif
 static PFN_cuGraphNodeGetDependentNodes_v10000 pfn_cuGraphNodeGetDependentNodes;
+static PFN_cuGraphKernelNodeGetParams_v12000 pfn_cuGraphKernelNodeGetParams;
+static PFN_cuGraphKernelNodeSetParams_v12000 pfn_cuGraphKernelNodeSetParams;
+static PFN_cuGraphKernelNodeGetAttribute_v11000 pfn_cuGraphKernelNodeGetAttribute;
+static PFN_cuGraphKernelNodeSetAttribute_v11000 pfn_cuGraphKernelNodeSetAttribute;
+#if CUDA_VERSION >= 12040
+static PFN_cuFuncGetParamInfo_v12040 pfn_cuFuncGetParamInfo;
+#endif
 static PFN_cuGraphNodeGetType_v10000 pfn_cuGraphNodeGetType;
 static PFN_cuModuleLoadDataEx_v2010 pfn_cuModuleLoadDataEx;
 static PFN_cuModuleUnload_v2000 pfn_cuModuleUnload;
@@ -283,6 +290,14 @@ bool init_cuda_driver()
         get_driver_entry_point("cuGraphAddNode", 12030, &(void*&)pfn_cuGraphAddNode);
 #endif
     get_driver_entry_point("cuGraphNodeGetDependentNodes", 10000, &(void*&)pfn_cuGraphNodeGetDependentNodes);
+    get_driver_entry_point("cuGraphKernelNodeGetParams", 12000, &(void*&)pfn_cuGraphKernelNodeGetParams);
+    get_driver_entry_point("cuGraphKernelNodeSetParams", 12000, &(void*&)pfn_cuGraphKernelNodeSetParams);
+    get_driver_entry_point("cuGraphKernelNodeGetAttribute", 11000, &(void*&)pfn_cuGraphKernelNodeGetAttribute);
+    get_driver_entry_point("cuGraphKernelNodeSetAttribute", 11000, &(void*&)pfn_cuGraphKernelNodeSetAttribute);
+#if CUDA_VERSION >= 12040
+    if (driver_version >= 12040)
+        get_driver_entry_point("cuFuncGetParamInfo", 12040, &(void*&)pfn_cuFuncGetParamInfo);
+#endif
     get_driver_entry_point("cuGraphNodeGetType", 10000, &(void*&)pfn_cuGraphNodeGetType);
     get_driver_entry_point("cuModuleLoadDataEx", 2010, &(void*&)pfn_cuModuleLoadDataEx);
     get_driver_entry_point("cuModuleUnload", 2000, &(void*&)pfn_cuModuleUnload);
@@ -849,6 +864,38 @@ CUresult cuGraphNodeGetType_f(CUgraphNode hNode, CUgraphNodeType* type)
 {
     return pfn_cuGraphNodeGetType ? pfn_cuGraphNodeGetType(hNode, type) : DRIVER_ENTRY_POINT_ERROR;
 }
+
+CUresult cuGraphKernelNodeGetParams_f(CUgraphNode hNode, CUDA_KERNEL_NODE_PARAMS* nodeParams)
+{
+    return pfn_cuGraphKernelNodeGetParams ? pfn_cuGraphKernelNodeGetParams(hNode, nodeParams)
+                                          : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuGraphKernelNodeSetParams_f(CUgraphNode hNode, const CUDA_KERNEL_NODE_PARAMS* nodeParams)
+{
+    return pfn_cuGraphKernelNodeSetParams ? pfn_cuGraphKernelNodeSetParams(hNode, nodeParams)
+                                          : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuGraphKernelNodeGetAttribute_f(CUgraphNode hNode, CUkernelNodeAttrID attr, CUkernelNodeAttrValue* value_out)
+{
+    return pfn_cuGraphKernelNodeGetAttribute ? pfn_cuGraphKernelNodeGetAttribute(hNode, attr, value_out)
+                                             : DRIVER_ENTRY_POINT_ERROR;
+}
+
+CUresult cuGraphKernelNodeSetAttribute_f(CUgraphNode hNode, CUkernelNodeAttrID attr, const CUkernelNodeAttrValue* value)
+{
+    return pfn_cuGraphKernelNodeSetAttribute ? pfn_cuGraphKernelNodeSetAttribute(hNode, attr, value)
+                                             : DRIVER_ENTRY_POINT_ERROR;
+}
+
+#if CUDA_VERSION >= 12040
+CUresult cuFuncGetParamInfo_f(CUfunction func, size_t paramIndex, size_t* paramOffset, size_t* paramSize)
+{
+    return pfn_cuFuncGetParamInfo ? pfn_cuFuncGetParamInfo(func, paramIndex, paramOffset, paramSize)
+                                  : DRIVER_ENTRY_POINT_ERROR;
+}
+#endif
 
 CUresult cuModuleLoadDataEx_f(
     CUmodule* module, const void* image, unsigned int numOptions, CUjit_option* options, void** optionValues

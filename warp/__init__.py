@@ -453,6 +453,9 @@ from warp._src.context import capture_get_conditional_bodies as capture_get_cond
 from warp._src.context import capture_invalidate as capture_invalidate
 from warp._src.context import capture_require_preparation as capture_require_preparation
 from warp._src.context import capture_complete_preparation as capture_complete_preparation
+from warp._src.context import capture_update_counts as capture_update_counts
+from warp._src.context import capture_get_count_update_errors as capture_get_count_update_errors
+from warp._src.context import capture_get_count_bound_launches as capture_get_count_bound_launches
 from warp._src.context import capture_begin as capture_begin
 from warp._src.context import capture_end as capture_end
 from warp._src.context import capture_launch as capture_launch
